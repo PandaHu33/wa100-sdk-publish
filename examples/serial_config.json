@@ -1,0 +1,13 @@
+{
+    "serial_port":[
+        {
+            "port":"COM4",
+            "baudrate":1000000,
+            "databyte":8,
+            "parity":0,
+            "stopbyte":1,
+            "flowcontrol":0,
+            "timeout_ms":100
+        }
+    ]
+}

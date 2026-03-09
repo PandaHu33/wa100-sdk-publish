@@ -1,0 +1,6 @@
+### Editor / IDE
+.vscode/
+
+### Build outputs (CMake)
+/build/
+/build_root/

@@ -4,3 +4,4 @@
 ### Build outputs (CMake)
 /build/
 /build_root/
+admittance_log.csv

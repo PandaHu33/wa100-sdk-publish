@@ -144,8 +144,15 @@ if(WIN32)
     target_link_libraries(udp_receiver ws2_32)
 endif()
 
+# 新增 Unity UDP 控制程序（接收Unity JSON并映射为6自由度）
+wa100_add_demo(udp_receiver_unity ${EXAMPLES_DIR}/udp_receiver_unity.cpp)
+if(WIN32)
+    # Winsock 库链接
+    target_link_libraries(udp_receiver_unity ws2_32)
+endif()
+
 # ========== 安装规则 ==========
-install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver
+install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver udp_receiver_unity
     RUNTIME DESTINATION bin
 )
 
@@ -160,6 +167,6 @@ elseif(UNIX)
 endif()
 
 message(STATUS "")
-message(STATUS "构建目标: basic_demo, advanced_demo, quickstart_demo")
+message(STATUS "构建目标: basic_demo, advanced_demo, quickstart_demo, udp_receiver, udp_receiver_unity")
 message(STATUS "输出目录: ${WA100_RUNTIME_DIR}")
 message(STATUS "========================================")

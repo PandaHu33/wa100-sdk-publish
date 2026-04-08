@@ -32,9 +32,10 @@ private:
     // State tracking to prevent callback flood (Rising edge detection)
     uint8_t last_error_flags[7]; // Index 1-6 used
     uint8_t last_leak_status;
+    bool last_all_bit7_active;
 
 public:
-    WA100FastDriver() : hSerial(INVALID_HANDLE_VALUE), connected(false), last_leak_status(0) {
+    WA100FastDriver() : hSerial(INVALID_HANDLE_VALUE), connected(false), last_leak_status(0), last_all_bit7_active(false) {
         memset(last_error_flags, 0, sizeof(last_error_flags));
     }
 
@@ -56,6 +57,7 @@ public:
         // Reset error state on new connection
         memset(last_error_flags, 0, sizeof(last_error_flags));
         last_leak_status = 0;
+        last_all_bit7_active = false;
         
         // Windows COM port numbering workaround for COM > 9
         std::string full_port_name = "\\\\.\\" + port;
@@ -358,6 +360,7 @@ private:
         // Data payload starts at index 4
         // Format: 6 * {Pos(2), Cur(2), Temp(1), Err(1)} + Leak(1) = 36 + 1 = 37 bytes
         const uint8_t* data = &packet[4];
+        uint8_t err_snapshot[6] = {0};
         
         for (int i=0; i<6; i++) {
             int offset = i * 6;
@@ -372,6 +375,7 @@ private:
             // Error Checking & Exception Callbacks
             uint8_t err = data[offset+5];
             uint8_t id = i + 1;
+            err_snapshot[i] = err;
             
             // Trigger only on rising edge (when error bit goes from 0 to 1)
             // or just present? Just present is too spammy. Using rising edge.
@@ -385,9 +389,34 @@ private:
 
             if (real_errors != last_real) {
                 // 状态变了，打印日志
-                std::cout << ">>> [Driver Debug] ID " << (int)id << " Status Changed: " 
-                          << std::hex << (int)last_error_flags[id] << " -> " << (int)err << std::dec 
-                          << " (Errors: " << (int)real_errors << ")" << std::endl;
+                std::cout << ">>> [Driver Debug] ID " << (int)id << " Status Changed: "
+                          << std::hex << (int)last_error_flags[id] << " -> " << (int)err << std::dec
+                          << " (Errors: " << (int)real_errors << ")";
+
+                if (real_errors == 0) {
+                    std::cout << " [clear]";
+                } else {
+                    std::cout << " [";
+                    bool first = true;
+                    auto print_flag = [&](const char* label) {
+                        if (!first) std::cout << ",";
+                        std::cout << label;
+                        first = false;
+                    };
+                    if (real_errors & 0x01) print_flag("stall");
+                    if (real_errors & 0x02) print_flag("over_temp");
+                    if (real_errors & 0x04) print_flag("over_current");
+                    if (real_errors & 0x08) print_flag("motor_fault");
+                    if (real_errors & 0x80) print_flag("bit7_global_or_unknown");
+
+                    uint8_t unknown_bits = real_errors & (~0x8F);
+                    if (unknown_bits) {
+                        if (!first) std::cout << ",";
+                        std::cout << "unknown_bits=0x" << std::hex << (int)unknown_bits << std::dec;
+                    }
+                    std::cout << "]";
+                }
+                std::cout << std::endl;
             }
             
             // Stall (0x01)
@@ -409,6 +438,20 @@ private:
             
             last_error_flags[id] = err;
         }
+
+        bool all_bit7 = true;
+        for (int i = 0; i < 6; ++i) {
+            if ((err_snapshot[i] & 0x80) == 0) {
+                all_bit7 = false;
+                break;
+            }
+        }
+        if (all_bit7 && !last_all_bit7_active) {
+            std::cerr << ">>> [Driver Warning] all 6 joints reported status bit 0x80 in the same sync frame; "
+                      << "this looks like a board-level or system-level protection event, not a single-joint fault."
+                      << std::endl;
+        }
+        last_all_bit7_active = all_bit7;
 
         // Leak Warning (Last Byte of Data payload)
         // Data starts at 4. Size 37. Last byte at 4+36 = 40.

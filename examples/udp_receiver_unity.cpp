@@ -132,6 +132,16 @@ static inline double LerpMap(double value, double in_min, double in_max, double 
     return out_min + t * (out_max - out_min);
 }
 
+static inline double AngleDegBetween(const Vec3& a, const Vec3& b) {
+    double denom = Norm(a) * Norm(b);
+    if (denom < 1e-9) return 0.0;
+    return std::acos(Clip(Dot(a, b) / denom, -1.0, 1.0)) * 180.0 / 3.14159265358979323846;
+}
+
+static inline double JointAngleDeg(const Vec3& parent, const Vec3& joint, const Vec3& child) {
+    return AngleDegBetween(Sub(parent, joint), Sub(child, joint));
+}
+
 static bool GetJoint(const std::vector<double>& pos, int idx, Vec3& out) {
     int base = idx * 3;
     if (base + 2 >= (int)pos.size()) return false;
@@ -156,6 +166,140 @@ static bool ParseHandSideArg(const char* arg, UnityHandSide& out_side) {
         return true;
     }
     return false;
+}
+
+static bool JsonStringEquals(const json& j, const char* key, const char* value) {
+    return j.contains(key) && j[key].is_string() && j[key].get<std::string>() == value;
+}
+
+static bool JsonStringContains(const json& j, const char* key, const char* needle) {
+    if (!j.contains(key) || !j[key].is_string()) return false;
+    return j[key].get<std::string>().find(needle) != std::string::npos;
+}
+
+struct VrHandCalibration {
+    double thumb_yaw_open = 0.988191;
+    double thumb_yaw_close = 0.528984;
+    double thumb_pitch_open = 165.31;
+    double thumb_pitch_close = 125.0;
+    double index_open = 153.179;
+    double index_close = 60.0;
+    double middle_open = 147.612;
+    double middle_close = 60.0;
+    double ring_open = 154.575;
+    double ring_close = 66.0;
+    double pinky_open = 160.095;
+    double pinky_close = 65.0;
+    double open_deadzone = 0.05;
+    double close_deadzone = 0.08;
+    double thumb_yaw_sensitivity = 1;
+    double thumb_pitch_sensitivity = 1;
+};
+
+static const VrHandCalibration VR_HAND_CALIBRATION;
+
+static uint16_t RatioToTarget(double ratio, double sensitivity = 1.0) {
+    double t = Clip(ratio, 0.0, 1.0);
+    if (t <= VR_HAND_CALIBRATION.open_deadzone) {
+        t = 0.0;
+    } else if (t >= 1.0 - VR_HAND_CALIBRATION.close_deadzone) {
+        t = 1.0;
+    } else {
+        t = (t - VR_HAND_CALIBRATION.open_deadzone) /
+            (1.0 - VR_HAND_CALIBRATION.open_deadzone - VR_HAND_CALIBRATION.close_deadzone);
+        t = Clip(t, 0.0, 1.0);
+        t = t * t * (3.0 - 2.0 * t);
+    }
+
+    double centered = (t - 0.5) * sensitivity + 0.5;
+    centered = Clip(centered, 0.0, 1.0);
+    double target = 2000.0 - centered * 2000.0;
+    return Clamp((int)std::lround(target), 0, 2000);
+}
+
+static double BendRatioFromAngle(double angle_deg, double open_deg, double close_deg) {
+    return Clip((open_deg - angle_deg) / std::max(1e-6, open_deg - close_deg), 0.0, 1.0);
+}
+
+static double FingerCurlRatio(
+    const std::vector<double>& hand_pos,
+    int mcp_idx,
+    int pip_idx,
+    int tip_idx,
+    double open_deg,
+    double close_deg) {
+    Vec3 mcp, pip, tip;
+    if (!GetJoint(hand_pos, mcp_idx, mcp) ||
+        !GetJoint(hand_pos, pip_idx, pip) ||
+        !GetJoint(hand_pos, tip_idx, tip)) {
+        return 0.0;
+    }
+
+    double pip_angle = JointAngleDeg(mcp, pip, tip);
+    return BendRatioFromAngle(pip_angle, open_deg, close_deg);
+}
+
+// Independent VR-hand-tracking calibration.
+// This path is selected only for packets marked as Unity XR Hands and does not
+// reuse the legacy/data-glove Euler calibration in MapUnityToTargets().
+static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
+    const char* pos_key = g_unity_hand_side == UnityHandSide::Left ? "leftPositions" : "rightPositions";
+
+    if (!j.contains(pos_key) || !j[pos_key].is_array()) {
+        return false;
+    }
+
+    std::vector<double> hand_pos;
+    hand_pos.reserve(j[pos_key].size());
+    for (const auto& v : j[pos_key]) {
+        if (!v.is_number()) return false;
+        hand_pos.push_back(v.get<double>());
+    }
+
+    if (hand_pos.size() < 63) {
+        return false;
+    }
+
+    Vec3 wrist, thumb_cmc, thumb_mcp, thumb_ip, thumb_tip;
+    Vec3 index_mcp, middle_mcp;
+    if (!GetJoint(hand_pos, 0, wrist) ||
+        !GetJoint(hand_pos, 1, thumb_cmc) ||
+        !GetJoint(hand_pos, 2, thumb_mcp) ||
+        !GetJoint(hand_pos, 3, thumb_ip) ||
+        !GetJoint(hand_pos, 4, thumb_tip) ||
+        !GetJoint(hand_pos, 5, index_mcp) ||
+        !GetJoint(hand_pos, 9, middle_mcp)) {
+        return false;
+    }
+
+    Vec3 palm_x = Normalize(Sub(index_mcp, wrist));
+    Vec3 palm_y = Normalize(Sub(middle_mcp, wrist));
+    Vec3 palm_z = Normalize(Cross(palm_x, palm_y));
+    Vec3 thumb_vec = Normalize(Sub(thumb_tip, thumb_cmc));
+
+    double thumb_across_palm = std::abs(Dot(thumb_vec, palm_x));
+    double thumb_yaw_ratio = LerpMap(
+        thumb_across_palm,
+        VR_HAND_CALIBRATION.thumb_yaw_open,
+        VR_HAND_CALIBRATION.thumb_yaw_close,
+        0.0,
+        1.0);
+
+    double thumb_pitch_angle = JointAngleDeg(thumb_cmc, thumb_mcp, thumb_tip);
+    double thumb_pitch_ratio = BendRatioFromAngle(
+        thumb_pitch_angle,
+        VR_HAND_CALIBRATION.thumb_pitch_open,
+        VR_HAND_CALIBRATION.thumb_pitch_close);
+
+    out_targets[0] = RatioToTarget(thumb_yaw_ratio, VR_HAND_CALIBRATION.thumb_yaw_sensitivity);
+    out_targets[1] = RatioToTarget(thumb_pitch_ratio, VR_HAND_CALIBRATION.thumb_pitch_sensitivity);
+    out_targets[2] = RatioToTarget(FingerCurlRatio(hand_pos, 5, 6, 8, VR_HAND_CALIBRATION.index_open, VR_HAND_CALIBRATION.index_close));
+    out_targets[3] = RatioToTarget(FingerCurlRatio(hand_pos, 9, 10, 12, VR_HAND_CALIBRATION.middle_open, VR_HAND_CALIBRATION.middle_close));
+    out_targets[4] = RatioToTarget(FingerCurlRatio(hand_pos, 13, 14, 16, VR_HAND_CALIBRATION.ring_open, VR_HAND_CALIBRATION.ring_close));
+    out_targets[5] = RatioToTarget(FingerCurlRatio(hand_pos, 17, 18, 20, VR_HAND_CALIBRATION.pinky_open, VR_HAND_CALIBRATION.pinky_close));
+
+    (void)palm_z;
+    return true;
 }
 
 // Map Unity hand joints to WA100 targets [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
@@ -360,6 +504,11 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
     try {
         std::string payload(data, data + len);
         json j = json::parse(payload);
+
+        if (JsonStringEquals(j, "source", "xr-hands") ||
+            JsonStringContains(j, "jointFormat", "unity-xr-hands")) {
+            return MapVrHandTrackingToTargets(j, out_targets);
+        }
 
         return MapUnityToTargets(j, out_targets);
     } catch (...) {

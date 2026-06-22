@@ -45,6 +45,17 @@ def _parse_row(row):
         return None
 
     try:
+        if len(row) >= 9:
+            t_ms = int(row[0])
+            joint_id = _normalize_joint_id(row[2])
+            raw_desired = int(row[3])
+            shaped_desired = int(row[4])
+            cmd = int(row[5])
+            real = int(row[6])
+            amp = int(row[7])
+            offset = int(row[8])
+            return t_ms, joint_id, raw_desired, shaped_desired, cmd, real, amp, offset
+
         if row[0].strip() == "DATA" and len(row) >= 7:
             t_ms = int(row[1])
             joint_id = _normalize_joint_id(row[2])

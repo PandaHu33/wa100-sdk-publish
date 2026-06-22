@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -36,10 +37,22 @@ enum class UnityHandSide {
     Right,
 };
 
+enum class ControlMode {
+    Glove = 0,
+    Preset = 1,
+};
+
+struct SerialSettings {
+    std::string port = "COM4";
+    uint32_t baudrate = 1000000;
+};
+
 // Global cross-thread state
 std::mutex g_mutex;
 uint16_t g_udp_target_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
+uint16_t g_preset_target_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 std::atomic<long long> g_last_udp_pkt_time = 0;
+std::atomic<int> g_control_mode((int)ControlMode::Glove);
 bool g_running = true;
 UnityHandSide g_unity_hand_side = UnityHandSide::Right;
 
@@ -153,6 +166,10 @@ static const char* HandSideToString(UnityHandSide side) {
     return side == UnityHandSide::Left ? "left" : "right";
 }
 
+static const char* ControlModeToString(ControlMode mode) {
+    return mode == ControlMode::Preset ? "preset" : "glove";
+}
+
 static bool ParseHandSideArg(const char* arg, UnityHandSide& out_side) {
     if (arg == nullptr) return false;
     std::string s(arg);
@@ -179,17 +196,17 @@ static bool JsonStringContains(const json& j, const char* key, const char* needl
 
 struct VrHandCalibration {
     double thumb_yaw_open = 0.988191;
-    double thumb_yaw_close = 0.528984;
+    double thumb_yaw_close = 0.558984;
     double thumb_pitch_open = 165.31;
     double thumb_pitch_close = 125.0;
     double index_open = 153.179;
-    double index_close = 60.0;
+    double index_close = 55.0;
     double middle_open = 147.612;
-    double middle_close = 60.0;
+    double middle_close = 55.0;
     double ring_open = 154.575;
-    double ring_close = 66.0;
+    double ring_close = 56.0;
     double pinky_open = 160.095;
-    double pinky_close = 65.0;
+    double pinky_close = 55.0;
     double open_deadzone = 0.05;
     double close_deadzone = 0.08;
     double thumb_yaw_sensitivity = 1;
@@ -300,6 +317,161 @@ static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
 
     (void)palm_z;
     return true;
+}
+
+static bool LooksLikeComPort(const std::string& value) {
+    if (value.size() < 4) return false;
+    std::string prefix = value.substr(0, 3);
+    std::transform(prefix.begin(), prefix.end(), prefix.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (prefix != "com") return false;
+    for (size_t i = 3; i < value.size(); ++i) {
+        if (!std::isdigit((unsigned char)value[i])) return false;
+    }
+    return true;
+}
+
+static std::vector<SerialSettings> LoadSerialSettingsList() {
+    SerialSettings defaults;
+    std::vector<SerialSettings> settings_list;
+    std::ifstream config_file("serial_config.json");
+    if (!config_file.is_open()) {
+        settings_list.push_back(defaults);
+        return settings_list;
+    }
+
+    try {
+        json cfg;
+        config_file >> cfg;
+        if (!cfg.contains("serial_port") || !cfg["serial_port"].is_array() || cfg["serial_port"].empty()) {
+            settings_list.push_back(defaults);
+            return settings_list;
+        }
+
+        for (const auto& serial_item : cfg["serial_port"]) {
+            if (!serial_item.is_object()) continue;
+            SerialSettings settings = defaults;
+            if (serial_item.contains("port") && serial_item["port"].is_string()) {
+                settings.port = serial_item["port"].get<std::string>();
+            }
+            if (serial_item.contains("baudrate") && serial_item["baudrate"].is_number_integer()) {
+                settings.baudrate = serial_item["baudrate"].get<uint32_t>();
+            }
+            settings_list.push_back(settings);
+        }
+    } catch (const std::exception& exc) {
+        std::cerr << ">>> Warning: failed to read serial_config.json: " << exc.what() << std::endl;
+    }
+
+    if (settings_list.empty()) {
+        settings_list.push_back(defaults);
+    }
+    return settings_list;
+}
+
+static bool ParseBaudrate(const std::string& text, uint32_t& out_baudrate) {
+    try {
+        size_t consumed = 0;
+        unsigned long parsed = std::stoul(text, &consumed, 10);
+        if (consumed != text.size() || parsed == 0) return false;
+        out_baudrate = (uint32_t)parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::string LowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return value;
+}
+
+static bool SameSerialPort(const std::string& a, const std::string& b) {
+    return LowerCopy(a) == LowerCopy(b);
+}
+
+static void AddSerialCandidate(std::vector<SerialSettings>& candidates, const SerialSettings& candidate) {
+    for (const auto& existing : candidates) {
+        if (SameSerialPort(existing.port, candidate.port) && existing.baudrate == candidate.baudrate) {
+            return;
+        }
+    }
+    candidates.push_back(candidate);
+}
+
+static std::vector<std::string> EnumerateAvailableComPorts() {
+    std::vector<std::string> ports;
+#ifdef _WIN32
+    char target[512];
+    for (int i = 1; i <= 32; ++i) {
+        std::string port = "COM" + std::to_string(i);
+        if (QueryDosDeviceA(port.c_str(), target, sizeof(target)) != 0) {
+            ports.push_back(port);
+        }
+    }
+#endif
+    return ports;
+}
+
+static bool ReadSixTargets(const json& arr, uint16_t out_targets[6]) {
+    if (!arr.is_array() || arr.size() != 6) return false;
+    for (int i = 0; i < 6; ++i) {
+        if (!arr[i].is_number()) return false;
+        out_targets[i] = Clamp((int)std::lround(arr[i].get<double>()), 0, 2000);
+    }
+    return true;
+}
+
+static void StorePresetTargets(const uint16_t targets[6]) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    memcpy(g_preset_target_pos, targets, sizeof(g_preset_target_pos));
+    memcpy(g_udp_target_pos, targets, sizeof(g_udp_target_pos));
+}
+
+static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& handled) {
+    handled = false;
+    if (!j.is_object()) return false;
+    if (!j.contains("type") || !j["type"].is_string() || j["type"].get<std::string>() != "h5_hand_control") {
+        return false;
+    }
+
+    handled = true;
+    std::string mode = j.value("mode", "glove");
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+    if (mode == "glove") {
+        g_control_mode.store((int)ControlMode::Glove);
+        std::cout << ">>> [H5] control mode -> glove" << std::endl;
+        return false;
+    }
+
+    if (mode == "preset" || mode == "program" || mode == "preprogrammed") {
+        g_control_mode.store((int)ControlMode::Preset);
+        uint16_t next_targets[6];
+        bool has_positions = j.contains("positions") && ReadSixTargets(j["positions"], next_targets);
+        if (has_positions) {
+            StorePresetTargets(next_targets);
+            memcpy(out_targets, next_targets, sizeof(uint16_t) * 6);
+        } else {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            memcpy(out_targets, g_preset_target_pos, sizeof(uint16_t) * 6);
+            memcpy(g_udp_target_pos, g_preset_target_pos, sizeof(uint16_t) * 6);
+        }
+
+        std::cout << ">>> [H5] control mode -> preset";
+        if (j.contains("name") && j["name"].is_string()) {
+            std::cout << " (" << j["name"].get<std::string>() << ")";
+        }
+        std::cout << " targets=[";
+        for (int i = 0; i < 6; ++i) {
+            if (i) std::cout << ",";
+            std::cout << out_targets[i];
+        }
+        std::cout << "]" << std::endl;
+        return true;
+    }
+
+    std::cerr << ">>> [H5] unknown control mode: " << mode << std::endl;
+    return false;
 }
 
 // Map Unity hand joints to WA100 targets [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
@@ -505,6 +677,18 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
         std::string payload(data, data + len);
         json j = json::parse(payload);
 
+        bool handled_control = false;
+        if (ParseH5ControlPacket(j, out_targets, handled_control)) {
+            return true;
+        }
+        if (handled_control) {
+            return false;
+        }
+
+        if (g_control_mode.load() != (int)ControlMode::Glove) {
+            return false;
+        }
+
         if (JsonStringEquals(j, "source", "xr-hands") ||
             JsonStringContains(j, "jointFormat", "unity-xr-hands")) {
             return MapVrHandTrackingToTargets(j, out_targets);
@@ -517,6 +701,7 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
 }
 
 void ComplianceControlLoop() {
+    constexpr long long kLogPeriodMs = 20;  // 50 Hz
     uint16_t current_pos[6] = {0};
     uint16_t current_amp[6] = {0};
     uint16_t final_cmd[6];
@@ -530,7 +715,7 @@ void ComplianceControlLoop() {
 
     std::ofstream log_file("admittance_log.csv");
     if (log_file.is_open()) {
-        log_file << "TIME,ID,RAW_DESIRED,SHAPED_DESIRED,CMD,REAL,AMP,OFFSET\n";
+        log_file << "TIME,WALL_TIME_MS,ID,RAW_DESIRED,SHAPED_DESIRED,CMD,REAL,AMP,OFFSET\n";
         std::cout << ">>> 日志文件已创建: admittance_log.csv" << std::endl;
     } else {
         std::cerr << ">>> 警告: 无法创建日志文件" << std::endl;
@@ -541,6 +726,10 @@ void ComplianceControlLoop() {
     auto last_freq_time = std::chrono::high_resolution_clock::now();
     long long loop_counter_freq = 0;
     auto last_step_time = std::chrono::high_resolution_clock::now();
+    auto log_start_time = std::chrono::steady_clock::now();
+    auto next_log_time = log_start_time;
+    long long log_sample_index = 0;
+    long long log_wall_time_start_ms = GetCurrentTimeMs();
 
     while (g_running) {
         auto now_step = std::chrono::high_resolution_clock::now();
@@ -650,15 +839,19 @@ void ComplianceControlLoop() {
             final_cmd[i] = Clamp(compliant_target, 0, 2000);
         }
 
-        static int log_counter = 0;
-        if (log_counter++ % 2 == 0) {
-            long long t = GetCurrentTimeMs();
-            if (log_file.is_open()) {
+        if (log_file.is_open()) {
+            auto now_log = std::chrono::steady_clock::now();
+            while (now_log >= next_log_time) {
+                long long sample_time_ms = log_sample_index * kLogPeriodMs;
+                long long wall_time_ms = log_wall_time_start_ms + sample_time_ms;
                 for (int i = 0; i < 6; i++) {
-                    log_file << t << ",ID" << (i + 1) << "," << desired_pos[i] << "," << shaped_desired[i] << ","
-                             << final_cmd[i] << "," << current_pos[i] << "," << (int)std::lround(filtered_amp[i]) << ","
+                    log_file << sample_time_ms << "," << wall_time_ms << ",ID" << (i + 1) << ","
+                             << desired_pos[i] << "," << shaped_desired[i] << "," << final_cmd[i] << ","
+                             << current_pos[i] << "," << (int)std::lround(filtered_amp[i]) << ","
                              << (int)std::lround(states[i].offset) << "\n";
                 }
+                ++log_sample_index;
+                next_log_time += std::chrono::milliseconds(kLogPeriodMs);
             }
         }
 
@@ -679,16 +872,77 @@ int main(int argc, char* argv[]) {
 
     std::cout << ">>> 准备连接灵巧手..." << std::endl;
 
-    if (argc >= 2) {
+    std::vector<SerialSettings> serial_candidates = LoadSerialSettingsList();
+    SerialSettings serial_settings = serial_candidates.front();
+    bool explicit_serial_override = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
         UnityHandSide parsed_side;
-        if (!ParseHandSideArg(argv[1], parsed_side)) {
-            std::cerr << "Usage: udp_receiver_unity [left|right]" << std::endl;
-            return -1;
+        if (ParseHandSideArg(arg.c_str(), parsed_side)) {
+            g_unity_hand_side = parsed_side;
+            continue;
         }
-        g_unity_hand_side = parsed_side;
+        if (arg == "--port" && i + 1 < argc) {
+            serial_settings.port = argv[++i];
+            explicit_serial_override = true;
+            continue;
+        }
+        if (arg.rfind("--port=", 0) == 0) {
+            serial_settings.port = arg.substr(7);
+            explicit_serial_override = true;
+            continue;
+        }
+        if (arg == "--baud" && i + 1 < argc) {
+            if (!ParseBaudrate(argv[++i], serial_settings.baudrate)) {
+                std::cerr << "Invalid baudrate" << std::endl;
+                return -1;
+            }
+            explicit_serial_override = true;
+            continue;
+        }
+        if (arg.rfind("--baud=", 0) == 0) {
+            if (!ParseBaudrate(arg.substr(7), serial_settings.baudrate)) {
+                std::cerr << "Invalid baudrate" << std::endl;
+                return -1;
+            }
+            explicit_serial_override = true;
+            continue;
+        }
+        if (LooksLikeComPort(arg)) {
+            serial_settings.port = arg;
+            explicit_serial_override = true;
+            continue;
+        }
+
+        std::cerr << "Usage: udp_receiver_unity [left|right] [COMx] [--port COMx] [--baud 1000000]" << std::endl;
+        return -1;
+    }
+
+    std::vector<std::string> available_ports = EnumerateAvailableComPorts();
+    if (explicit_serial_override) {
+        serial_candidates.clear();
+        serial_candidates.push_back(serial_settings);
+    } else if (available_ports.size() == 1) {
+        bool configured_port_is_available = false;
+        for (const auto& candidate : serial_candidates) {
+            if (SameSerialPort(candidate.port, available_ports[0])) {
+                configured_port_is_available = true;
+                break;
+            }
+        }
+        if (!configured_port_is_available) {
+            SerialSettings fallback = serial_candidates.front();
+            fallback.port = available_ports[0];
+            AddSerialCandidate(serial_candidates, fallback);
+        }
     }
 
     std::cout << ">>> Unity hand source: " << HandSideToString(g_unity_hand_side) << std::endl;
+    std::cout << ">>> Serial candidates:";
+    for (const auto& candidate : serial_candidates) {
+        std::cout << " " << candidate.port << "@" << candidate.baudrate;
+    }
+    std::cout << std::endl;
 
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -724,6 +978,9 @@ int main(int argc, char* argv[]) {
               << "Positions/"
               << HandSideToString(g_unity_hand_side)
               << "Rotations" << std::endl;
+    std::cout << ">>> H5 control: JSON {type:h5_hand_control, mode:glove|preset, positions:[6]} on same UDP port" << std::endl;
+    std::cout << ">>> initial hand control mode: "
+              << ControlModeToString((ControlMode)g_control_mode.load()) << std::endl;
     std::cout << ">>> tendon-driven mode: one-way admittance only, soft current band "
               << SOFT_CURRENT_WARN_MA << "-" << SOFT_CURRENT_RELEASE_MA
               << "mA, hardware limit " << HARD_CURRENT_LIMIT_MA << "mA" << std::endl;
@@ -738,10 +995,20 @@ int main(int argc, char* argv[]) {
                   << std::endl;
     });
 
-    if (!g_fast_driver.Connect("COM4", 1000000)) {
-        std::cerr << ">>> 严重错误: 无法打开 COM4!" << std::endl;
+    bool serial_connected = false;
+    for (const auto& candidate : serial_candidates) {
+        std::cout << ">>> Trying serial port: " << candidate.port << " @ " << candidate.baudrate << std::endl;
+        if (g_fast_driver.Connect(candidate.port, candidate.baudrate)) {
+            serial_settings = candidate;
+            serial_connected = true;
+            break;
+        }
+    }
+    if (!serial_connected) {
+        std::cerr << ">>> 严重错误: 无法打开配置的串口!" << std::endl;
         return -1;
     }
+    std::cout << ">>> Serial connected: " << serial_settings.port << " @ " << serial_settings.baudrate << std::endl;
 
     std::cout << ">>> [初始化] 等待总线稳定 (1s)..." << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -783,15 +1050,23 @@ int main(int argc, char* argv[]) {
         int len = recvfrom(server_fd, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&client_addr, &client_len);
         if (len > 0) {
             bool got_valid = false;
-            int latest_len = len;
             int drained_packets = 0;
+            auto process_packet = [&](const char* packet, int packet_len) {
+                if (ParseUnityUdpPacket(packet, packet_len, temp_pos)) {
+                    memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
+                    got_valid = true;
+                }
+            };
 
-            // Drain only a bounded number of packets and keep just the latest payload.
-            // This avoids spending all CPU time parsing stale Unity frames.
+            process_packet(buffer, len);
+
+            // Drain only a bounded number of packets. H5 control packets must be
+            // parsed as they appear; otherwise a following Unity frame can hide a
+            // single click mode switch.
             while (drained_packets < MAX_UDP_DRAIN_PER_TICK) {
                 int next_len = recvfrom(server_fd, buffer, BUFFER_SIZE, 0, NULL, NULL);
                 if (next_len > 0) {
-                    latest_len = next_len;
+                    process_packet(buffer, next_len);
                     drained_packets++;
                 } else {
                     break;
@@ -803,11 +1078,6 @@ int main(int argc, char* argv[]) {
                     std::cerr << ">>> [UDP] queue busy, dropped stale Unity packets after "
                               << MAX_UDP_DRAIN_PER_TICK << " drains" << std::endl;
                 }
-            }
-
-            if (ParseUnityUdpPacket(buffer, latest_len, temp_pos)) {
-                memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
-                got_valid = true;
             }
 
             if (got_valid) {

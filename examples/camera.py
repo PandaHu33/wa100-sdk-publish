@@ -352,6 +352,10 @@ def main():
         print(f">>> 尝试打开摄像头 ID {index}...")
         temp_cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) # Windows下推荐使用 CAP_DSHOW 增加稳定性
         if temp_cap.isOpened():
+            temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            temp_cap.set(cv2.CAP_PROP_FPS, 30)
             print(f">>> 成功打开摄像头 ID {index}")
             cap = temp_cap
             break

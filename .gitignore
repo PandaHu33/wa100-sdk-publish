@@ -5,3 +5,4 @@
 /build/
 /build_root/
 admittance_log.csv
+admittance_log*.csv

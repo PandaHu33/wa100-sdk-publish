@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -32,6 +33,18 @@ using json = nlohmann::json;
 #define BUFFER_SIZE 65536
 #define MAX_UDP_DRAIN_PER_TICK 16
 
+bool IsCsvLoggingEnabled() {
+    const char* value = std::getenv("WA100_ENABLE_CSV_LOG");
+    if (value == nullptr) {
+        return false;
+    }
+    std::string flag(value);
+    std::transform(flag.begin(), flag.end(), flag.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return flag == "1" || flag == "true" || flag == "yes" || flag == "on";
+}
+
 enum class UnityHandSide {
     Left,
     Right,
@@ -39,7 +52,8 @@ enum class UnityHandSide {
 
 enum class ControlMode {
     Glove = 0,
-    Preset = 1,
+    Vr = 1,
+    Preset = 2,
 };
 
 struct SerialSettings {
@@ -167,7 +181,9 @@ static const char* HandSideToString(UnityHandSide side) {
 }
 
 static const char* ControlModeToString(ControlMode mode) {
-    return mode == ControlMode::Preset ? "preset" : "glove";
+    if (mode == ControlMode::Vr) return "vr";
+    if (mode == ControlMode::Preset) return "preset";
+    return "glove";
 }
 
 static bool ParseHandSideArg(const char* arg, UnityHandSide& out_side) {
@@ -444,6 +460,12 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
         return false;
     }
 
+    if (mode == "vr" || mode == "vision" || mode == "hand_tracking") {
+        g_control_mode.store((int)ControlMode::Vr);
+        std::cout << ">>> [H5] control mode -> vr" << std::endl;
+        return false;
+    }
+
     if (mode == "preset" || mode == "program" || mode == "preprogrammed") {
         g_control_mode.store((int)ControlMode::Preset);
         uint16_t next_targets[6];
@@ -685,16 +707,16 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
             return false;
         }
 
-        if (g_control_mode.load() != (int)ControlMode::Glove) {
-            return false;
+        const bool is_vr_packet = JsonStringEquals(j, "source", "xr-hands") ||
+                                  JsonStringContains(j, "jointFormat", "unity-xr-hands");
+        const ControlMode active_mode = (ControlMode)g_control_mode.load();
+        if (active_mode == ControlMode::Vr) {
+            return is_vr_packet ? MapVrHandTrackingToTargets(j, out_targets) : false;
         }
-
-        if (JsonStringEquals(j, "source", "xr-hands") ||
-            JsonStringContains(j, "jointFormat", "unity-xr-hands")) {
-            return MapVrHandTrackingToTargets(j, out_targets);
+        if (active_mode == ControlMode::Glove) {
+            return is_vr_packet ? false : MapUnityToTargets(j, out_targets);
         }
-
-        return MapUnityToTargets(j, out_targets);
+        return false;
     } catch (...) {
         return false;
     }
@@ -713,11 +735,14 @@ void ComplianceControlLoop() {
     double desired_filters[6] = {0.0};
     double filtered_amp[6] = {0.0};
 
-    std::ofstream log_file("admittance_log.csv");
+    std::ofstream log_file;
+    if (IsCsvLoggingEnabled()) {
+        log_file.open("admittance_log.csv");
+    }
     if (log_file.is_open()) {
         log_file << "TIME,WALL_TIME_MS,ID,RAW_DESIRED,SHAPED_DESIRED,CMD,REAL,AMP,OFFSET\n";
         std::cout << ">>> 日志文件已创建: admittance_log.csv" << std::endl;
-    } else {
+    } else if (IsCsvLoggingEnabled()) {
         std::cerr << ">>> 警告: 无法创建日志文件" << std::endl;
     }
 
@@ -978,7 +1003,7 @@ int main(int argc, char* argv[]) {
               << "Positions/"
               << HandSideToString(g_unity_hand_side)
               << "Rotations" << std::endl;
-    std::cout << ">>> H5 control: JSON {type:h5_hand_control, mode:glove|preset, positions:[6]} on same UDP port" << std::endl;
+    std::cout << ">>> H5 control: JSON {type:h5_hand_control, mode:vr|glove|preset, positions:[6]} on same UDP port" << std::endl;
     std::cout << ">>> initial hand control mode: "
               << ControlModeToString((ControlMode)g_control_mode.load()) << std::endl;
     std::cout << ">>> tendon-driven mode: one-way admittance only, soft current band "

@@ -568,10 +568,10 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     // Yaw: use the most local thumb joint delta to suppress whole-palm rotation coupling.
     // Keep the sign so the motion stays monotonic through the sweep.
     // Pitch: use distal joint local Y-axis delta, which is more stable than wrist-distance in Euler space.
-    const double THUMB_YAW_MIN = -15;
-    const double THUMB_YAW_MAX = 8.0;
+    const double THUMB_YAW_MIN = -12;
+    const double THUMB_YAW_MAX = 5.0;
     const double THUMB_PITCH_MIN = 40.0;
-    const double THUMB_PITCH_MAX = 85.0;
+    const double THUMB_PITCH_MAX = 80.0;
     const double THUMB_YAW_SENSITIVITY = 1.35;
     const double THUMB_PITCH_SENSITIVITY_BASE = 2.0;
     const double THUMB_PITCH_SENSITIVITY_AT_MIN_YAW = 0.5;

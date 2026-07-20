@@ -1,6 +1,9 @@
 ### Editor / IDE
 .vscode/
 
+### Python caches
+__pycache__/
+
 ### Build outputs (CMake)
 /build/
 /build_current/

@@ -90,7 +90,7 @@ const uint16_t HARD_CURRENT_LIMIT_MA = 1000;
 const uint16_t SOFT_CURRENT_WARN_MA = 550;
 const uint16_t SOFT_CURRENT_RELEASE_MA = 680;
 const double CURRENT_FILTER_ALPHA = 0.25;
-const double DESIRED_SLEW_RATE = 3500.0;
+const double DESIRED_SLEW_RATE = 4500.0;
 const double MAX_ADMITTANCE_VEL = 3500.0;
 const double MAX_ADMITTANCE_OFFSET = 1800.0;
 const uint16_t INVALID_POSITION_THRESHOLD = 10000;
@@ -656,7 +656,7 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
 
     // Additional safety: per-packet slew-rate limit for index->pinky.
     static uint16_t last_finger_targets[4] = {2000, 2000, 2000, 2000};
-    const int MAX_STEP_PER_PACKET = 80;
+    const int MAX_STEP_PER_PACKET = 100;
     for (int i = 0; i < 4; ++i) {
         uint16_t* t = &out_targets[2 + i];
         int diff = (int)(*t) - (int)last_finger_targets[i];

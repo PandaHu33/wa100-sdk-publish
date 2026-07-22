@@ -149,10 +149,19 @@ endif()
 
 # 新增 Unity UDP 控制程序（接收Unity JSON并映射为6自由度）
 wa100_add_demo(udp_receiver_unity ${EXAMPLES_DIR}/udp_receiver_unity.cpp)
+target_sources(udp_receiver_unity PRIVATE ${EXAMPLES_DIR}/glove_thumb_mapper.cpp)
 if(WIN32)
     # Winsock 库链接
     target_link_libraries(udp_receiver_unity ws2_32)
 endif()
+
+enable_testing()
+add_executable(glove_thumb_mapper_test
+    ${SDK_ROOT_DIR}/tests/glove_thumb_mapper_test.cpp
+    ${EXAMPLES_DIR}/glove_thumb_mapper.cpp
+)
+target_include_directories(glove_thumb_mapper_test PRIVATE ${EXAMPLES_DIR})
+add_test(NAME glove_thumb_mapper_test COMMAND glove_thumb_mapper_test)
 
 # ========== 安装规则 ==========
 install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver udp_receiver_unity

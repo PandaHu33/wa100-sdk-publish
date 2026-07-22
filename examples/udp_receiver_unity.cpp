@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #include "wa100_fast_driver.h"
 #include "json.hpp"
+#include "glove_thumb_mapper.h"
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +89,9 @@ std::atomic<long long> g_last_udp_pkt_time = 0;
 std::atomic<int> g_control_mode((int)ControlMode::Glove);
 bool g_running = true;
 UnityHandSide g_unity_hand_side = UnityHandSide::Right;
+glove_thumb::Mapper g_glove_thumb_mapper;
+glove_thumb::MappingDebug g_last_thumb_mapping_debug;
+std::string g_thumb_calibration_path;
 
 WA100FastDriver g_fast_driver;
 
@@ -474,6 +478,136 @@ static void StorePresetTargets(const uint16_t targets[6]) {
     memcpy(g_udp_target_pos, targets, sizeof(g_udp_target_pos));
 }
 
+static json ThumbMappingDebugToJson(const glove_thumb::MappingDebug& debug) {
+    return {
+        {"configured", debug.configured},
+        {"valid", debug.valid},
+        {"calibration_id", debug.calibration_id},
+        {"error", debug.error},
+        {"feature_norm", debug.feature_norm},
+        {"residual_norm", debug.residual_norm},
+        {"yaw_projected", debug.yaw_projected},
+        {"pitch_projected", debug.pitch_projected},
+        {"yaw_score", debug.yaw_score},
+        {"pitch_score", debug.pitch_score},
+        {"yaw_ratio", debug.yaw_ratio},
+        {"pitch_ratio", debug.pitch_ratio},
+        {"yaw_target", debug.yaw_target},
+        {"pitch_target", debug.pitch_target},
+    };
+}
+
+static bool ReadFixedVector(
+    const json& value,
+    std::array<double, glove_thumb::kFeatureDimension>& output,
+    std::string& error,
+    const char* name) {
+    if (!value.is_array() || value.size() != glove_thumb::kFeatureDimension) {
+        error = std::string(name) + " must contain 21 numbers";
+        return false;
+    }
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        if (!value[index].is_number()) {
+            error = std::string(name) + " contains a non-number";
+            return false;
+        }
+        output[index] = value[index].get<double>();
+    }
+    return true;
+}
+
+static bool LoadGloveThumbCalibration(const std::string& path, std::string& error) {
+    std::ifstream stream(path);
+    if (!stream.is_open()) {
+        error = "cannot open calibration file: " + path;
+        return false;
+    }
+
+    try {
+        json root;
+        stream >> root;
+        glove_thumb::Calibration calibration;
+        calibration.schema_version = root.at("schema_version").get<int>();
+        calibration.calibration_id = root.at("calibration_id").get<std::string>();
+        calibration.hand = root.at("hand").get<std::string>();
+        calibration.euler_order = root.at("euler_order").get<std::string>();
+
+        const auto& joints = root.at("feature_joint_indices");
+        if (!joints.is_array() || joints.size() != glove_thumb::kSelectedJointCount) {
+            error = "feature_joint_indices must contain 7 integers";
+            return false;
+        }
+        for (std::size_t index = 0; index < calibration.joint_indices.size(); ++index) {
+            calibration.joint_indices[index] = joints[index].get<int>();
+        }
+
+        const auto& references = root.at("reference_quaternions_wxyz");
+        if (!references.is_array() || references.size() != glove_thumb::kSelectedJointCount) {
+            error = "reference_quaternions_wxyz must contain 7 quaternions";
+            return false;
+        }
+        for (std::size_t index = 0; index < calibration.reference_quaternions.size(); ++index) {
+            const auto& values = references[index];
+            if (!values.is_array() || values.size() != 4) {
+                error = "each reference quaternion must contain [w,x,y,z]";
+                return false;
+            }
+            calibration.reference_quaternions[index] = {
+                values[0].get<double>(), values[1].get<double>(), values[2].get<double>(), values[3].get<double>()};
+        }
+
+        const auto& nuisance = root.at("nuisance_basis");
+        if (!nuisance.is_array()) {
+            error = "nuisance_basis must be an array";
+            return false;
+        }
+        for (const auto& row : nuisance) {
+            std::array<double, glove_thumb::kFeatureDimension> vector{};
+            if (!ReadFixedVector(row, vector, error, "nuisance_basis row")) return false;
+            calibration.nuisance_basis.push_back(vector);
+        }
+        if (!ReadFixedVector(root.at("yaw_axis"), calibration.yaw_axis, error, "yaw_axis")) return false;
+        if (!ReadFixedVector(root.at("pitch_axis"), calibration.pitch_axis, error, "pitch_axis")) return false;
+
+        const auto& demix = root.at("demix_matrix");
+        if (!demix.is_array() || demix.size() != 2 || !demix[0].is_array() || !demix[1].is_array() ||
+            demix[0].size() != 2 || demix[1].size() != 2) {
+            error = "demix_matrix must be 2x2";
+            return false;
+        }
+        for (std::size_t row = 0; row < 2; ++row) {
+            for (std::size_t column = 0; column < 2; ++column) {
+                calibration.demix[row][column] = demix[row][column].get<double>();
+            }
+        }
+
+        const auto& ranges = root.at("score_ranges");
+        calibration.yaw_open_score = ranges.at("yaw").at("open").get<double>();
+        calibration.yaw_close_score = ranges.at("yaw").at("close").get<double>();
+        calibration.pitch_open_score = ranges.at("pitch").at("open").get<double>();
+        calibration.pitch_close_score = ranges.at("pitch").at("close").get<double>();
+        if (root.contains("mapping")) {
+            calibration.open_deadzone = root["mapping"].value("open_deadzone", calibration.open_deadzone);
+            calibration.close_deadzone = root["mapping"].value("close_deadzone", calibration.close_deadzone);
+        }
+
+        if (calibration.hand != HandSideToString(g_unity_hand_side)) {
+            error = "calibration hand does not match selected Unity hand";
+            return false;
+        }
+        return g_glove_thumb_mapper.Configure(calibration, &error);
+    } catch (const std::exception& exception) {
+        error = std::string("invalid calibration JSON: ") + exception.what();
+        return false;
+    }
+}
+
+static std::string ExecutableDirectory(const char* argv0) {
+    const std::string path = argv0 == nullptr ? std::string() : std::string(argv0);
+    const std::size_t separator = path.find_last_of("\\/");
+    return separator == std::string::npos ? std::string(".") : path.substr(0, separator);
+}
+
 static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& handled) {
     handled = false;
     if (!j.is_object()) return false;
@@ -529,22 +663,9 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
 
 // Map Unity hand joints to WA100 targets [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
 static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
-    const char* pos_key = g_unity_hand_side == UnityHandSide::Left ? "leftPositions" : "rightPositions";
     const char* rot_key = g_unity_hand_side == UnityHandSide::Left ? "leftRotations" : "rightRotations";
 
-    if (!j.contains(pos_key) || !j[pos_key].is_array() ||
-        !j.contains(rot_key) || !j[rot_key].is_array()) {
-        return false;
-    }
-
-    std::vector<double> hand_pos;
-    hand_pos.reserve(j[pos_key].size());
-    for (const auto& v : j[pos_key]) {
-        if (!v.is_number()) return false;
-        hand_pos.push_back(v.get<double>());
-    }
-
-    if (hand_pos.size() < 63) {
+    if (!j.contains(rot_key) || !j[rot_key].is_array()) {
         return false;
     }
 
@@ -559,19 +680,12 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         return false;
     }
 
-    Vec3 wrist_r;
-    Vec3 thumb_cmc_r, thumb_mcp_r, thumb_ip_r;
-    Vec3 thumb_cmc_p, thumb_mcp_p, thumb_ip_p, thumb_tip_p;
     Vec3 index_mcp_r, index_pip_r;
     Vec3 middle_mcp_r, middle_pip_r;
     Vec3 ring_mcp_r, ring_pip_r;
     Vec3 pinky_mcp_r, pinky_pip_r;
 
-    if (!GetJoint(hand_rot, 0, wrist_r) ||
-        !GetJoint(hand_rot, 1, thumb_cmc_r) || !GetJoint(hand_rot, 2, thumb_mcp_r) || !GetJoint(hand_rot, 3, thumb_ip_r) ||
-        !GetJoint(hand_pos, 1, thumb_cmc_p) || !GetJoint(hand_pos, 2, thumb_mcp_p) || !GetJoint(hand_pos, 3, thumb_ip_p) ||
-        !GetJoint(hand_pos, 4, thumb_tip_p) ||
-        !GetJoint(hand_rot, 5, index_mcp_r) || !GetJoint(hand_rot, 6, index_pip_r) || !GetJoint(hand_rot, 9, middle_mcp_r) ||
+    if (!GetJoint(hand_rot, 5, index_mcp_r) || !GetJoint(hand_rot, 6, index_pip_r) || !GetJoint(hand_rot, 9, middle_mcp_r) ||
         !GetJoint(hand_rot, 10, middle_pip_r) || !GetJoint(hand_rot, 13, ring_mcp_r) || !GetJoint(hand_rot, 14, ring_pip_r) ||
         !GetJoint(hand_rot, 17, pinky_mcp_r) || !GetJoint(hand_rot, 18, pinky_pip_r)) {
         return false;
@@ -581,60 +695,16 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         return std::sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
     };
 
-    auto rot_to_target = [&](double mag_deg, double open_deg, double close_deg) -> uint16_t {
-        // open -> 2000, close -> 0
-        double bend = LerpMap(mag_deg, open_deg, close_deg, 0.0, 1.0);
-        double target = 2000.0 + bend * (0.0 - 2000.0);
-        return Clamp((int)std::lround(target), 0, 2000);
-    };
-
-    auto apply_target_sensitivity = [&](uint16_t target, double sensitivity) -> uint16_t {
-        // Scale motion around the mid-point so sensitivity can be tuned independently from the feature range.
-        double centered = ((double)target - 1000.0) * sensitivity;
-        double scaled = 1000.0 + centered;
-        return Clamp((int)std::lround(scaled), 0, 2000);
-    };
-
-    // Thumb calibration parameters.
-    // Yaw: use the most local thumb joint delta to suppress whole-palm rotation coupling.
-    // Keep the sign so the motion stays monotonic through the sweep.
-    // Pitch: use distal joint local Y-axis delta, which is more stable than wrist-distance in Euler space.
-    const double THUMB_YAW_MIN = -12;
-    const double THUMB_YAW_MAX = 5.0;
-    const double THUMB_PITCH_MIN = 40.0;
-    const double THUMB_PITCH_MAX = 80.0;
-    const double THUMB_YAW_SENSITIVITY = 1.35;
-    const double THUMB_PITCH_SENSITIVITY_BASE = 2.0;
-    const double THUMB_PITCH_SENSITIVITY_AT_MIN_YAW = 0.5;
-
-    // Thumb yaw:
-    // Prefer the distal local Z delta. It stays more local than root-vs-palm features and,
-    // without abs(), preserves direction through the middle of the motion.
-    double thumb_mcp_rel_x = AngleDiffDeg(thumb_mcp_r.x, thumb_cmc_r.x);
-    double thumb_mcp_rel_y = AngleDiffDeg(thumb_mcp_r.y, thumb_cmc_r.y);
-    double thumb_mcp_rel_z = AngleDiffDeg(thumb_mcp_r.z, thumb_cmc_r.z);
-    double thumb_ip_rel_x = AngleDiffDeg(thumb_ip_r.x, thumb_mcp_r.x);
-    double thumb_ip_rel_y = AngleDiffDeg(thumb_ip_r.y, thumb_mcp_r.y);
-    double thumb_ip_rel_z = AngleDiffDeg(thumb_ip_r.z, thumb_mcp_r.z);
-
-    double thumb_yaw_feature = thumb_ip_rel_z;
-
-    auto rot_to_target_inverted = [&](double mag_deg, double open_deg, double close_deg) -> uint16_t {
-        double bend = LerpMap(mag_deg, open_deg, close_deg, 0.0, 1.0);
-        double target = bend * 2000.0;
-        return Clamp((int)std::lround(target), 0, 2000);
-    };
-    uint16_t thumb_yaw_target_base = rot_to_target_inverted(thumb_yaw_feature, THUMB_YAW_MIN, THUMB_YAW_MAX);
-    out_targets[0] = apply_target_sensitivity(thumb_yaw_target_base, THUMB_YAW_SENSITIVITY);
-
-    // Thumb pitch: use the IP local Y-axis bend, which remains meaningful under whole-hand rotation.
-    double thumb_pitch_feature = std::abs(thumb_ip_rel_y);
-    uint16_t thumb_pitch_target_base = rot_to_target(thumb_pitch_feature, THUMB_PITCH_MIN, THUMB_PITCH_MAX);
-    double yaw_feature_ratio = Clip((thumb_yaw_feature - THUMB_YAW_MIN) / (THUMB_YAW_MAX - THUMB_YAW_MIN), 0.0, 1.0);
-    double thumb_pitch_sensitivity =
-        THUMB_PITCH_SENSITIVITY_AT_MIN_YAW +
-        (THUMB_PITCH_SENSITIVITY_BASE - THUMB_PITCH_SENSITIVITY_AT_MIN_YAW) * yaw_feature_ratio;
-    out_targets[1] = apply_target_sensitivity(thumb_pitch_target_base, thumb_pitch_sensitivity);
+    std::vector<glove_thumb::EulerDeg> rotations;
+    rotations.reserve(21);
+    for (std::size_t joint_index = 0; joint_index < 21; ++joint_index) {
+        const std::size_t base = joint_index * 3;
+        rotations.push_back({hand_rot[base], hand_rot[base + 1], hand_rot[base + 2]});
+    }
+    g_last_thumb_mapping_debug = g_glove_thumb_mapper.Map(rotations);
+    // Missing or invalid calibration fails safe for the two thumb motors only.
+    out_targets[0] = g_last_thumb_mapping_debug.valid ? g_last_thumb_mapping_debug.yaw_target : 2000;
+    out_targets[1] = g_last_thumb_mapping_debug.valid ? g_last_thumb_mapping_debug.pitch_target : 2000;
 
     // Fingers: use weighted MCP/PIP rotation magnitude
     double idx_feature = 0.35 * rot_mag(index_mcp_r) + 0.65 * rot_mag(index_pip_r);
@@ -695,30 +765,6 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         if (diff < -MAX_STEP_PER_PACKET) *t = (uint16_t)(last_finger_targets[i] - MAX_STEP_PER_PACKET);
         last_finger_targets[i] = *t;
     }
-
-    // One-line live print (1Hz): thumb raw data + thumb target + finger calibration.
-    // static auto last_cali_print_time = std::chrono::high_resolution_clock::now();
-    // auto now_cali = std::chrono::high_resolution_clock::now();
-    // double cali_elapsed = std::chrono::duration<double>(now_cali - last_cali_print_time).count();
-    // if (cali_elapsed >= 1.0) {
-    //     std::cout << "\n>>> THUMB RAW pos(cmc/mcp/ip/tip)="
-    //               << "(" << thumb_cmc_p.x << "," << thumb_cmc_p.y << "," << thumb_cmc_p.z << ")/"
-    //               << "(" << thumb_mcp_p.x << "," << thumb_mcp_p.y << "," << thumb_mcp_p.z << ")/"
-    //               << "(" << thumb_ip_p.x << "," << thumb_ip_p.y << "," << thumb_ip_p.z << ")/"
-    //               << "(" << thumb_tip_p.x << "," << thumb_tip_p.y << "," << thumb_tip_p.z << ")"
-    //               << " rot(cmc/mcp/ip)="
-    //               << "(" << thumb_cmc_r.x << "," << thumb_cmc_r.y << "," << thumb_cmc_r.z << ")/"
-    //               << "(" << thumb_mcp_r.x << "," << thumb_mcp_r.y << "," << thumb_mcp_r.z << ")/"
-    //               << "(" << thumb_ip_r.x << "," << thumb_ip_r.y << "," << thumb_ip_r.z << ")"
-    //               << " feat(mcpRelX/mcpRelY/mcpRelZ/yawSigned/ipRelX/ipRelY/ipRelZ/pitch/yawSens/pitchSens)="
-    //               << thumb_mcp_rel_x << "/" << thumb_mcp_rel_y << "/" << thumb_mcp_rel_z << "/"
-    //               << thumb_yaw_feature << "/"
-    //               << thumb_ip_rel_x << "/" << thumb_ip_rel_y << "/" << thumb_ip_rel_z << "/" << thumb_pitch_feature << "/"
-    //               << THUMB_YAW_SENSITIVITY << "/" << thumb_pitch_sensitivity
-    //               << " tgt(yaw/pitch)=[" << out_targets[0] << "," << out_targets[1] << "]"
-    //               << std::flush;
-    //     last_cali_print_time = now_cali;
-    // }
 
     return true;
 }
@@ -983,6 +1029,10 @@ int main(int argc, char* argv[]) {
     std::vector<SerialSettings> serial_candidates = LoadSerialSettingsList();
     SerialSettings serial_settings = serial_candidates.front();
     bool explicit_serial_override = false;
+    const char* calibration_env = std::getenv("WA100_THUMB_CALIBRATION_PATH");
+    g_thumb_calibration_path = calibration_env != nullptr && calibration_env[0] != '\0'
+        ? std::string(calibration_env)
+        : ExecutableDirectory(argc > 0 ? argv[0] : nullptr) + "\\thumb_glove_calibration.json";
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         UnityHandSide parsed_side;
@@ -1016,14 +1066,32 @@ int main(int argc, char* argv[]) {
             explicit_serial_override = true;
             continue;
         }
+        if (arg == "--thumb-calibration" && i + 1 < argc) {
+            g_thumb_calibration_path = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--thumb-calibration=", 0) == 0) {
+            g_thumb_calibration_path = arg.substr(20);
+            continue;
+        }
         if (LooksLikeComPort(arg)) {
             serial_settings.port = arg;
             explicit_serial_override = true;
             continue;
         }
 
-        std::cerr << "Usage: udp_receiver_unity [left|right] [COMx] [--port COMx] [--baud 1000000]" << std::endl;
+        std::cerr << "Usage: udp_receiver_unity [left|right] [COMx] [--port COMx] [--baud 1000000] "
+                     "[--thumb-calibration path.json]" << std::endl;
         return -1;
+    }
+
+    std::string thumb_calibration_error;
+    if (LoadGloveThumbCalibration(g_thumb_calibration_path, thumb_calibration_error)) {
+        std::cout << ">>> Glove thumb calibration: " << g_thumb_calibration_path
+                  << " (" << g_glove_thumb_mapper.calibration().calibration_id << ")" << std::endl;
+    } else {
+        std::cerr << ">>> WARNING: glove thumb calibration inactive: " << thumb_calibration_error << std::endl;
+        std::cerr << ">>> Thumb yaw/pitch will stay at safe-open 2000; index-to-pinky mapping remains active." << std::endl;
     }
 
     std::vector<std::string> available_ports = EnumerateAvailableComPorts();
@@ -1083,9 +1151,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << ">>> Unity JSON source: "
               << HandSideToString(g_unity_hand_side)
-              << "Positions/"
-              << HandSideToString(g_unity_hand_side)
-              << "Rotations" << std::endl;
+              << "Rotations (glove mode does not use Positions)" << std::endl;
     std::cout << ">>> H5 control: JSON {type:h5_hand_control, mode:vr|glove|preset, positions:[6]} on same UDP port" << std::endl;
     std::cout << ">>> initial hand control mode: "
               << ControlModeToString((ControlMode)g_control_mode.load()) << std::endl;
@@ -1179,7 +1245,14 @@ int main(int argc, char* argv[]) {
                         record["mapped_target_units"] = std::vector<uint16_t>(temp_pos, temp_pos + 6);
                     }
                     try {
-                        record["unity_payload"] = json::parse(std::string(packet, packet + packet_len));
+                        json parsed_payload = json::parse(std::string(packet, packet + packet_len));
+                        record["unity_payload"] = parsed_payload;
+                        const char* rotation_key = g_unity_hand_side == UnityHandSide::Left
+                            ? "leftRotations" : "rightRotations";
+                        if (accepted && parsed_payload.contains(rotation_key) &&
+                            (ControlMode)g_control_mode.load() == ControlMode::Glove) {
+                            record["thumb_mapping_debug"] = ThumbMappingDebugToJson(g_last_thumb_mapping_debug);
+                        }
                     } catch (...) {
                         record["raw_payload"] = std::string(packet, packet + packet_len);
                     }

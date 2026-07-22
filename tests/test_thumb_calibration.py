@@ -1,0 +1,75 @@
+import sys
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "examples"))
+
+from thumb_calibration import JOINT_INDICES, calibration_payload, fit_candidate  # noqa: E402
+
+
+def sample(common=(0.0, 0.0, 0.0), yaw=0.0, pitch=0.0, fingers=0.0):
+    value = np.zeros((len(JOINT_INDICES), 3), dtype=float)
+    value += np.asarray(common, dtype=float)
+    value[0, 1] += yaw
+    value[2, 2] += pitch
+    value[3:, 0] += fingers
+    return value
+
+
+def repeated(value, count=30):
+    return [np.array(value, copy=True) for _ in range(count)]
+
+
+class ThumbCalibrationTests(unittest.TestCase):
+    def synthetic_states(self):
+        wrist = []
+        wrist_validate = []
+        for index in range(90):
+            angle = 18.0 * np.sin(index * 0.16)
+            common = (angle, 12.0 * np.cos(index * 0.11), 9.0 * np.sin(index * 0.09))
+            wrist.append(sample(common=common))
+            wrist_validate.append(sample(common=common))
+        yaw_sweep = [sample(yaw=30.0 * (0.5 + 0.5 * np.sin(index * 0.2))) for index in range(90)]
+        pitch_sweep = [sample(pitch=35.0 * (0.5 + 0.5 * np.sin(index * 0.2))) for index in range(90)]
+        return {
+            "neutral": repeated(sample()),
+            "wrist_train": wrist,
+            "four_fingers": [sample(fingers=35.0 * (0.5 + 0.5 * np.sin(index * 0.2))) for index in range(60)],
+            "yaw_open": repeated(sample(yaw=0.0)),
+            "yaw_close": repeated(sample(yaw=30.0)),
+            "yaw_sweep": yaw_sweep,
+            "pitch_open": repeated(sample(pitch=0.0)),
+            "pitch_close": repeated(sample(pitch=35.0)),
+            "pitch_sweep": pitch_sweep,
+            "combined": [sample(yaw=index / 3.0, pitch=index / 2.5) for index in range(60)],
+            "wrist_validate": wrist_validate,
+        }
+
+    def test_fit_rejects_common_wrist_motion_and_separates_actions(self):
+        fit = fit_candidate(self.synthetic_states(), "xyz")
+        metrics = fit["metrics"]
+        self.assertTrue(metrics["quality_pass"], metrics)
+        self.assertLessEqual(metrics["wrist_validation_yaw_target_range"], 1e-5)
+        self.assertLessEqual(metrics["wrist_validation_pitch_target_range"], 1e-5)
+        self.assertGreaterEqual(metrics["yaw_sweep_target_range"], 1900.0)
+        self.assertGreaterEqual(metrics["pitch_sweep_target_range"], 1900.0)
+        self.assertLessEqual(metrics["yaw_sweep_pitch_crosstalk"], 1e-5)
+        self.assertLessEqual(metrics["pitch_sweep_yaw_crosstalk"], 1e-5)
+
+    def test_payload_has_runtime_schema(self):
+        states = self.synthetic_states()
+        fit = fit_candidate(states, "xyz")
+        payload = calibration_payload("right", fit, {key: len(value) for key, value in states.items()})
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["hand"], "right")
+        self.assertEqual(len(payload["yaw_axis"]), 21)
+        self.assertEqual(np.asarray(payload["demix_matrix"]).shape, (2, 2))
+        self.assertTrue(payload["quality"]["quality_pass"])
+
+
+if __name__ == "__main__":
+    unittest.main()

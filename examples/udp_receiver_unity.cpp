@@ -30,6 +30,8 @@ using json = nlohmann::json;
 
 #define UDP_IP "127.0.0.1"
 #define PORT 25001
+#define RECORDING_TELEMETRY_IP "127.0.0.1"
+#define RECORDING_TELEMETRY_PORT 25003
 #define BUFFER_SIZE 65536
 #define MAX_UDP_DRAIN_PER_TICK 16
 
@@ -43,6 +45,23 @@ bool IsCsvLoggingEnabled() {
         return static_cast<char>(std::tolower(ch));
     });
     return flag == "1" || flag == "true" || flag == "yes" || flag == "on";
+}
+
+bool IsUnityInputLoggingEnabled() {
+    const char* value = std::getenv("WA100_ENABLE_UNITY_INPUT_LOG");
+    if (value == nullptr) {
+        return false;
+    }
+    std::string flag(value);
+    std::transform(flag.begin(), flag.end(), flag.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return flag == "1" || flag == "true" || flag == "yes" || flag == "on";
+}
+
+std::string GetLogPath(const char* env_name, const char* fallback) {
+    const char* value = std::getenv(env_name);
+    return value != nullptr && value[0] != '\0' ? std::string(value) : std::string(fallback);
 }
 
 enum class UnityHandSide {
@@ -75,6 +94,18 @@ WA100FastDriver g_fast_driver;
 long long GetCurrentTimeMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+long long GetCurrentTimeNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+long long GetSteadyTimeNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
@@ -730,6 +761,8 @@ void ComplianceControlLoop() {
     uint16_t desired_pos[6];
     uint16_t shaped_desired[6];
     uint16_t last_valid_pos[6] = {0};
+    bool position_feedback_valid[6] = {false};
+    bool local_soft_release_active[6] = {false};
 
     SecondOrderState states[6];
     double desired_filters[6] = {0.0};
@@ -737,7 +770,7 @@ void ComplianceControlLoop() {
 
     std::ofstream log_file;
     if (IsCsvLoggingEnabled()) {
-        log_file.open("admittance_log.csv");
+        log_file.open(GetLogPath("WA100_CSV_LOG_PATH", "admittance_log.csv"));
     }
     if (log_file.is_open()) {
         log_file << "TIME,WALL_TIME_MS,ID,RAW_DESIRED,SHAPED_DESIRED,CMD,REAL,AMP,OFFSET\n";
@@ -755,6 +788,13 @@ void ComplianceControlLoop() {
     auto next_log_time = log_start_time;
     long long log_sample_index = 0;
     long long log_wall_time_start_ms = GetCurrentTimeMs();
+    auto next_telemetry_time = log_start_time;
+    std::uint64_t telemetry_sequence = 0;
+    SOCKET telemetry_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in telemetry_address{};
+    telemetry_address.sin_family = AF_INET;
+    telemetry_address.sin_port = htons(RECORDING_TELEMETRY_PORT);
+    telemetry_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
 
     while (g_running) {
         auto now_step = std::chrono::high_resolution_clock::now();
@@ -779,14 +819,16 @@ void ComplianceControlLoop() {
             first_run = false;
         }
 
-        if (!g_fast_driver.SyncWriteRead(final_cmd, current_pos, current_amp)) {
+        const bool feedback_valid = g_fast_driver.SyncWriteRead(final_cmd, current_pos, current_amp);
+        if (!feedback_valid) {
             // Ignore transient communication failures.
         }
 
         for (int i = 0; i < 6; i++) {
             // Filter out clearly invalid position feedback such as 0xFFFF.
             // Small overshoot around 2000 is still considered valid.
-            if (current_pos[i] <= INVALID_POSITION_THRESHOLD) {
+            position_feedback_valid[i] = feedback_valid && current_pos[i] <= INVALID_POSITION_THRESHOLD;
+            if (position_feedback_valid[i]) {
                 last_valid_pos[i] = current_pos[i];
             } else {
                 static int invalid_pos_log_limit[6] = {0};
@@ -805,7 +847,9 @@ void ComplianceControlLoop() {
             desired_filters[i] += delta;
             shaped_desired[i] = Clamp((int)std::lround(desired_filters[i]), 0, 2000);
 
-            if (current_amp[i] > SOFT_CURRENT_RELEASE_MA || filtered_amp[i] > SOFT_CURRENT_RELEASE_MA) {
+            local_soft_release_active[i] =
+                current_amp[i] > SOFT_CURRENT_RELEASE_MA || filtered_amp[i] > SOFT_CURRENT_RELEASE_MA;
+            if (local_soft_release_active[i]) {
                 states[i].offset = (double)((int)current_pos[i] - (int)shaped_desired[i]);
                 states[i].velocity = 0.0;
                 static int log_limit = 0;
@@ -887,7 +931,46 @@ void ComplianceControlLoop() {
             loop_counter_freq = 0;
             last_freq_time = now_freq;
         }
+
+        auto telemetry_now = std::chrono::steady_clock::now();
+        if (telemetry_now >= next_telemetry_time && telemetry_socket != INVALID_SOCKET) {
+            json telemetry;
+            telemetry["type"] = "wa100_recording_state";
+            telemetry["schema_version"] = 2;
+            telemetry["seq"] = telemetry_sequence++;
+            telemetry["source_time_ns"] = GetCurrentTimeNs();
+            telemetry["source_monotonic_ns"] = GetSteadyTimeNs();
+            telemetry["control_mode"] = ControlModeToString((ControlMode)g_control_mode.load());
+            telemetry["feedback_valid"] = feedback_valid;
+            telemetry["position_valid"] = std::vector<bool>(position_feedback_valid, position_feedback_valid + 6);
+            telemetry["actual_position_units"] = std::vector<uint16_t>(current_pos, current_pos + 6);
+            telemetry["target_position_units"] = std::vector<uint16_t>(desired_pos, desired_pos + 6);
+            telemetry["command_position_units"] = std::vector<uint16_t>(final_cmd, final_cmd + 6);
+            telemetry["raw_current_ma"] = std::vector<uint16_t>(current_amp, current_amp + 6);
+            telemetry["filtered_current_ma"] = std::vector<double>(filtered_amp, filtered_amp + 6);
+            std::vector<double> offsets(6);
+            for (int index = 0; index < 6; ++index) offsets[index] = states[index].offset;
+            telemetry["compliance_offset_units"] = offsets;
+            telemetry["local_soft_release_active"] =
+                std::vector<bool>(local_soft_release_active, local_soft_release_active + 6);
+            telemetry["local_protection"] = {
+                {"hard_current_limit_ma", HARD_CURRENT_LIMIT_MA},
+                {"soft_current_warn_ma", SOFT_CURRENT_WARN_MA},
+                {"soft_current_release_ma", SOFT_CURRENT_RELEASE_MA},
+                {"one_way_unloading_preserved", true},
+            };
+            telemetry["current_semantics"] = "motor_current_load_proxy_not_force_or_tactile";
+            const std::string encoded = telemetry.dump();
+            sendto(
+                telemetry_socket, encoded.data(), static_cast<int>(encoded.size()), 0,
+                reinterpret_cast<const sockaddr*>(&telemetry_address), sizeof(telemetry_address));
+            next_telemetry_time += std::chrono::milliseconds(kLogPeriodMs);
+            if (telemetry_now - next_telemetry_time > std::chrono::milliseconds(100)) {
+                next_telemetry_time = telemetry_now + std::chrono::milliseconds(kLogPeriodMs);
+            }
+        }
     }
+    if (telemetry_socket != INVALID_SOCKET) closesocket(telemetry_socket);
 }
 
 int main(int argc, char* argv[]) {
@@ -1071,13 +1154,39 @@ int main(int argc, char* argv[]) {
     uint16_t temp_pos[6];
     uint16_t latest_valid_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
     int dropped_packet_log_counter = 0;
+    std::ofstream unity_input_log;
+    if (IsUnityInputLoggingEnabled()) {
+        const std::string input_log_path = GetLogPath("WA100_UNITY_INPUT_LOG_PATH", "unity_input_log.jsonl");
+        unity_input_log.open(input_log_path, std::ios::out | std::ios::app);
+        if (unity_input_log.is_open()) {
+            std::cout << ">>> Unity input log: " << input_log_path << std::endl;
+        } else {
+            std::cerr << ">>> Warning: failed to create Unity input log: " << input_log_path << std::endl;
+        }
+    }
     while (true) {
         int len = recvfrom(server_fd, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&client_addr, &client_len);
         if (len > 0) {
             bool got_valid = false;
             int drained_packets = 0;
             auto process_packet = [&](const char* packet, int packet_len) {
-                if (ParseUnityUdpPacket(packet, packet_len, temp_pos)) {
+                const bool accepted = ParseUnityUdpPacket(packet, packet_len, temp_pos);
+                if (unity_input_log.is_open()) {
+                    json record;
+                    record["recv_time_ns"] = GetCurrentTimeNs();
+                    record["accepted"] = accepted;
+                    if (accepted) {
+                        record["mapped_target_units"] = std::vector<uint16_t>(temp_pos, temp_pos + 6);
+                    }
+                    try {
+                        record["unity_payload"] = json::parse(std::string(packet, packet + packet_len));
+                    } catch (...) {
+                        record["raw_payload"] = std::string(packet, packet + packet_len);
+                    }
+                    unity_input_log << record.dump() << '\n';
+                    unity_input_log.flush();
+                }
+                if (accepted) {
                     memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
                     got_valid = true;
                 }

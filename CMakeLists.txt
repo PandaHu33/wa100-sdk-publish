@@ -88,7 +88,10 @@ else()
     add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
 endif()
 
-set(WA100_RUNTIME_DIR ${CMAKE_BINARY_DIR}/bin)
+# Keep WA100 runtime artifacts in one canonical location even when CMake is
+# configured from another build tree. This avoids multiple executable copies
+# whose source revisions are difficult to distinguish at runtime.
+set(WA100_RUNTIME_DIR ${SDK_ROOT_DIR}/build/bin)
 
 function(wa100_add_demo target_name source_file)
     add_executable(${target_name} ${source_file})

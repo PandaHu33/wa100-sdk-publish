@@ -24,8 +24,8 @@ Calibration BaseCalibration() {
     value.calibration_id = "unit-test";
     value.hand = "right";
     value.euler_order = "xyz";
-    value.yaw_axis[1] = 1.0;    // thumb CMC Y
-    value.pitch_axis[8] = 1.0;  // thumb IP Z
+    value.yaw_axis[1] = 1.0;    // relative thumb Y
+    value.pitch_axis[8] = 1.0;  // relative thumb IP Z
     value.yaw_open_score = 0.0;
     value.yaw_close_score = 30.0;
     value.pitch_open_score = 0.0;
@@ -60,23 +60,14 @@ void TestEulerWrapIsContinuous() {
     Require(a.yaw_target == b.yaw_target, "equivalent Euler wraps must have identical targets");
 }
 
-void TestNuisanceProjectionRejectsCommonRotation() {
-    Calibration calibration = BaseCalibration();
-    std::array<double, glove_thumb::kFeatureDimension> common_x{};
-    for (std::size_t selected = 0; selected < glove_thumb::kSelectedJointCount; ++selected) {
-        common_x[selected * 3] = 1.0;
-    }
-    calibration.nuisance_basis.push_back(common_x);
+void TestNeutralPoseIsOpen() {
     Mapper mapper;
     std::string error;
-    Require(mapper.Configure(calibration, &error), "nuisance calibration: " + error);
-
-    auto rotations = NeutralRotations();
-    for (int joint : calibration.joint_indices) rotations[static_cast<std::size_t>(joint)].x = 25.0;
-    const auto result = mapper.Map(rotations);
-    Require(result.valid, "common rotation sample must be valid");
-    Require(result.residual_norm < 1e-6, "learned common rotation must be projected out");
-    Require(result.yaw_target == 2000 && result.pitch_target == 2000, "common rotation must keep thumb open");
+    Require(mapper.Configure(BaseCalibration(), &error), "neutral calibration: " + error);
+    const auto result = mapper.Map(NeutralRotations());
+    Require(result.valid, "neutral sample must be valid");
+    Require(result.residual_norm < 1e-6, "neutral sample must have zero relative rotation");
+    Require(result.yaw_target == 2000 && result.pitch_target == 2000, "neutral thumb must stay open");
 }
 
 void TestYawAndPitchAreIndependent() {
@@ -112,7 +103,7 @@ void TestInvalidCalibrationFailsSafe() {
 
 int main() {
     TestEulerWrapIsContinuous();
-    TestNuisanceProjectionRejectsCommonRotation();
+    TestNeutralPoseIsOpen();
     TestYawAndPitchAreIndependent();
     TestInvalidCalibrationFailsSafe();
     std::cout << "glove_thumb_mapper_test: PASS" << std::endl;

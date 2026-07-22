@@ -1,18 +1,18 @@
 # Hi5 手套拇指 Rotation 标定
 
-本流程只改变手套模式的拇指横摇和弯曲通道。食指到小指、VR hand tracking 和预设姿态不使用该标定。
+本流程只改变手套模式的拇指横摇和弯曲通道。当前基线按“拇指仅一个物理姿态传感器、标定和运行时手腕固定”设计，以中立姿态为参考，对 Hi5 数据包暴露的三个派生拇指骨骼 rotation 做可观测性与解耦标定。食指到小指、VR hand tracking 和预设姿态不使用该标定。
 
 ## 运行标定
 
 1. 停止 `udp_receiver_unity.exe`，保持 Hi5 手套连接正常。
 2. 启动 Unity 程序 `right1/My project.exe`，确认它向 `127.0.0.1:25001` 发送数据。
-3. 在仓库根目录运行：
+3. 在仓库根目录运行图形化在线标定：
 
 ```powershell
-python examples/thumb_calibration.py --hand right
+python examples/thumb_calibration_gui.py --hand right
 ```
 
-按提示完成中立姿态、腕部三轴旋转、四指干扰、拇指横摇、拇指弯曲和验证动作。标定约需 80 秒有效采集时间。
+在窗口中逐阶段点击“开始当前阶段”，固定手腕完成中立姿态、拇指横摇、拇指弯曲、组合动作和中立复测。无图形界面时仍可运行 `thumb_calibration.py --hand right` 使用命令行流程。
 
 通过质量门限后，配置写入：
 
@@ -20,7 +20,13 @@ python examples/thumb_calibration.py --hand right
 build/bin/thumb_glove_calibration.json
 ```
 
-若腕部串扰超过 100、横摇或弯曲有效跨度不足 1600，脚本只写诊断文件，不覆盖运行时配置。
+标定使用连续动作作为反例学习两个判别方向：横摇方向压低弯曲样本方差，弯曲方向压低横摇样本方差。若固定腕姿下中立复测漂移超过 100、任一通道串扰超过 100、横摇或弯曲有效跨度不足 1600，脚本只写诊断文件，不覆盖运行时配置。本基线明确不消除腕部运动；后续接入 VR 手柄后再使用手柄腕姿构造腕部参考系，并与本版对比。
+
+已有原始样本可直接重新拟合，无需再次采集：
+
+```powershell
+python examples/thumb_calibration.py --hand right --from-samples build/bin/thumb_glove_calibration_samples.npz
+```
 
 ## 启动和回放
 

@@ -1,21 +1,17 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "calibration_id": "synthetic-test-only",
   "hand": "right",
+  "model": "single_thumb_fixed_wrist",
   "euler_order": "xyz",
-  "feature_joint_indices": [1, 2, 3, 5, 9, 13, 17],
+  "feature_joint_indices": [1, 2, 3],
   "reference_quaternions_wxyz": [
-    [1, 0, 0, 0],
-    [1, 0, 0, 0],
-    [1, 0, 0, 0],
-    [1, 0, 0, 0],
     [1, 0, 0, 0],
     [1, 0, 0, 0],
     [1, 0, 0, 0]
   ],
-  "nuisance_basis": [],
-  "yaw_axis": [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-  "pitch_axis": [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "yaw_axis": [0, 1, 0, 0, 0, 0, 0, 0, 0],
+  "pitch_axis": [0, 0, 0, 0, 0, 0, 0, 0, 1],
   "demix_matrix": [[1, 0], [0, 1]],
   "score_ranges": {
     "yaw": {"open": 0, "close": 30},

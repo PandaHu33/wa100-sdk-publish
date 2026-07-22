@@ -25,7 +25,7 @@ import numpy as np
 UDP_IP = "127.0.0.1"
 UDP_PORT = 25001
 BUFFER_SIZE = 65536
-JOINT_INDICES = (1, 2, 3, 5, 9, 13, 17)
+JOINT_INDICES = (1, 2, 3)
 EULER_ORDERS = ("xyz", "xzy", "yxz", "yzx", "zxy", "zyx")
 FEATURE_DIMENSION = len(JOINT_INDICES) * 3
 
@@ -39,17 +39,15 @@ class State:
 
 
 STATES = (
-    State("neutral", "中立静止", "手腕置中，五指自然伸展，拇指自然外展并伸直。", 3.0),
-    State("wrist_train", "腕部干扰训练", "所有手指完全不动，缓慢绕腕部三个方向连续旋转。", 10.0),
-    State("four_fingers", "四指干扰训练", "手腕和拇指不动，只让食指到小指反复屈伸。", 7.0),
-    State("yaw_open", "拇指横摇张开端", "手腕和其余手指不动，拇指横向自然外展并保持。", 3.0),
-    State("yaw_close", "拇指横摇对掌端", "拇指保持伸直，横向移向掌心并保持。", 3.0),
-    State("yaw_sweep", "拇指横摇往返", "拇指保持伸直，横摇张开到对掌，缓慢往返至少三次。", 10.0),
-    State("pitch_open", "拇指弯曲张开端", "拇指保持自然横摇位置并完全伸直。", 3.0),
-    State("pitch_close", "拇指弯曲闭合端", "横摇位置尽量不变，只让拇指完全弯曲并保持。", 3.0),
-    State("pitch_sweep", "拇指弯曲往返", "横摇位置尽量不变，弯曲和伸直缓慢往返至少三次。", 10.0),
-    State("combined", "拇指组合动作", "组合进行横摇和弯曲，覆盖日常使用范围。", 10.0),
-    State("wrist_validate", "腕部独立验证", "恢复自然伸展，所有手指不动，再缓慢旋转腕部三个方向。", 10.0),
+    State("neutral", "中立静止", "固定手腕，拇指自然外展并伸直；之后所有阶段保持同一腕姿。", 3.0),
+    State("yaw_open", "拇指横摇张开端", "手腕固定，拇指保持伸直，横向自然外展并保持。", 3.0),
+    State("yaw_close", "拇指横摇对掌端", "手腕固定，拇指保持伸直，横向移向掌心并保持。", 3.0),
+    State("yaw_sweep", "拇指横摇往返", "手腕固定、拇指保持伸直，横摇缓慢往返至少三次。", 10.0),
+    State("pitch_open", "拇指弯曲张开端", "手腕固定，拇指保持自然横摇位置并完全伸直。", 3.0),
+    State("pitch_close", "拇指弯曲闭合端", "手腕固定、横摇位置不变，只让拇指完全弯曲并保持。", 3.0),
+    State("pitch_sweep", "拇指弯曲往返", "手腕固定、横摇位置不变，弯曲和伸直缓慢往返至少三次。", 10.0),
+    State("combined", "拇指组合动作", "手腕固定，组合进行横摇和弯曲，覆盖日常使用范围。", 10.0),
+    State("neutral_validate", "中立姿态复测", "保持同一腕姿，恢复拇指自然外展和伸直并保持。", 5.0),
 )
 
 
@@ -161,34 +159,24 @@ def build_references(neutral: Sequence[np.ndarray], order: str) -> np.ndarray:
     return np.vstack(references)
 
 
+def conjugate(value: np.ndarray) -> np.ndarray:
+    return np.array([value[0], -value[1], -value[2], -value[3]], dtype=float)
+
+
 def features(samples: Sequence[np.ndarray], references: np.ndarray, order: str) -> np.ndarray:
     rows = []
     for sample in samples:
         row = []
         for selected in range(len(JOINT_INDICES)):
             current = euler_to_quaternion(sample[selected], order)
-            reference = references[selected]
-            delta = multiply(np.array([reference[0], -reference[1], -reference[2], -reference[3]]), current)
+            # The Hi5 packet exposes three thumb-bone rotations even when the
+            # glove has one physical thumb sensor. Preserve all three derived
+            # slots so calibration can determine whether two motions remain
+            # observable; do not introduce a wrist reference in this baseline.
+            delta = multiply(conjugate(references[selected]), current)
             row.extend(quaternion_log_deg(delta))
         rows.append(row)
     return np.asarray(rows, dtype=float)
-
-
-def nuisance_basis(matrix: np.ndarray, max_rank: int = 8) -> np.ndarray:
-    if len(matrix) < 2:
-        return np.empty((0, FEATURE_DIMENSION), dtype=float)
-    _, singular, vh = np.linalg.svd(matrix, full_matrices=False)
-    if not len(singular) or singular[0] < 1e-8:
-        return np.empty((0, FEATURE_DIMENSION), dtype=float)
-    energy = singular * singular
-    cumulative = np.cumsum(energy) / max(float(np.sum(energy)), 1e-12)
-    rank = int(np.searchsorted(cumulative, 0.995) + 1)
-    rank = min(rank, max_rank, int(np.sum(singular >= singular[0] * 0.03)))
-    return vh[: max(1, rank)]
-
-
-def reject_nuisance(matrix: np.ndarray, basis: np.ndarray) -> np.ndarray:
-    return matrix if basis.size == 0 else matrix - (matrix @ basis.T) @ basis
 
 
 def target_ratio(score: np.ndarray, open_score: float, close_score: float) -> np.ndarray:
@@ -210,91 +198,108 @@ def target_range(score: np.ndarray, open_score: float, close_score: float) -> fl
 def fit_candidate(samples: Dict[str, List[np.ndarray]], order: str) -> dict:
     references = build_references(samples["neutral"], order)
     matrices = {key: features(value, references, order) for key, value in samples.items()}
-    neutral_mean = np.mean(matrices["neutral"], axis=0)
-    nuisance_rows = np.vstack((matrices["wrist_train"], matrices["four_fingers"])) - neutral_mean
-    basis = nuisance_basis(nuisance_rows)
-    residual = {key: reject_nuisance(value, basis) for key, value in matrices.items()}
-
-    yaw_delta = np.mean(residual["yaw_close"], axis=0) - np.mean(residual["yaw_open"], axis=0)
-    pitch_delta = np.mean(residual["pitch_close"], axis=0) - np.mean(residual["pitch_open"], axis=0)
+    yaw_delta = np.mean(matrices["yaw_close"], axis=0) - np.mean(matrices["yaw_open"], axis=0)
+    pitch_delta = np.mean(matrices["pitch_close"], axis=0) - np.mean(matrices["pitch_open"], axis=0)
     yaw_norm, pitch_norm = float(np.linalg.norm(yaw_delta)), float(np.linalg.norm(pitch_delta))
     if min(yaw_norm, pitch_norm) < 1e-6:
         raise ValueError(f"{order}: thumb endpoint motion is degenerate")
-    yaw_axis, pitch_axis = yaw_delta / yaw_norm, pitch_delta / pitch_norm
+    neutral_covariance = np.cov(np.vstack((matrices["neutral"], matrices["neutral_validate"])), rowvar=False)
+    yaw_covariance = np.cov(matrices["yaw_sweep"], rowvar=False)
+    pitch_covariance = np.cov(matrices["pitch_sweep"], rowvar=False)
+    scale = max(float(np.trace(neutral_covariance + yaw_covariance + pitch_covariance)) / (3.0 * FEATURE_DIMENSION), 1e-8)
+    identity = np.eye(FEATURE_DIMENSION)
+    candidates = []
 
-    def projected(key: str) -> np.ndarray:
-        return np.column_stack((residual[key] @ yaw_axis, residual[key] @ pitch_axis))
-
-    yaw_change = np.mean(projected("yaw_close"), axis=0) - np.mean(projected("yaw_open"), axis=0)
-    pitch_change = np.mean(projected("pitch_close"), axis=0) - np.mean(projected("pitch_open"), axis=0)
-    response = np.column_stack((yaw_change, pitch_change))
-    condition = float(np.linalg.cond(response))
-    if not math.isfinite(condition) or condition > 1000.0:
-        raise ValueError(f"{order}: yaw/pitch response is singular")
-    demix = np.linalg.inv(response)
-
-    scores = {key: projected(key) @ demix.T for key in residual}
-    yaw_open = float(np.median(scores["yaw_open"][:, 0]))
-    yaw_close = float(np.median(scores["yaw_close"][:, 0]))
-    pitch_open = float(np.median(scores["pitch_open"][:, 1]))
-    pitch_close = float(np.median(scores["pitch_close"][:, 1]))
-
-    metrics = {
-        "nuisance_rank": int(len(basis)),
-        "response_condition": condition,
-        "yaw_feature_span": yaw_norm,
-        "pitch_feature_span": pitch_norm,
-        "wrist_validation_yaw_target_range": target_range(scores["wrist_validate"][:, 0], yaw_open, yaw_close),
-        "wrist_validation_pitch_target_range": target_range(scores["wrist_validate"][:, 1], pitch_open, pitch_close),
-        "yaw_sweep_target_range": target_range(scores["yaw_sweep"][:, 0], yaw_open, yaw_close),
-        "yaw_sweep_pitch_crosstalk": target_range(scores["yaw_sweep"][:, 1], pitch_open, pitch_close),
-        "pitch_sweep_target_range": target_range(scores["pitch_sweep"][:, 1], pitch_open, pitch_close),
-        "pitch_sweep_yaw_crosstalk": target_range(scores["pitch_sweep"][:, 0], yaw_open, yaw_close),
-    }
-    metrics["quality_pass"] = bool(
-        min(yaw_norm, pitch_norm) >= 5.0
-        and condition <= 20.0
-        and metrics["wrist_validation_yaw_target_range"] <= 100.0
-        and metrics["wrist_validation_pitch_target_range"] <= 100.0
-        and metrics["yaw_sweep_target_range"] >= 1600.0
-        and metrics["pitch_sweep_target_range"] >= 1600.0
-        and metrics["yaw_sweep_pitch_crosstalk"] <= 100.0
-        and metrics["pitch_sweep_yaw_crosstalk"] <= 100.0
-    )
-    penalty = (
-        metrics["wrist_validation_yaw_target_range"]
-        + metrics["wrist_validation_pitch_target_range"]
-        + metrics["yaw_sweep_pitch_crosstalk"]
-        + metrics["pitch_sweep_yaw_crosstalk"]
-    )
-    reward = metrics["yaw_sweep_target_range"] + metrics["pitch_sweep_target_range"]
-    score = reward - 4.0 * penalty - 10.0 * condition
-    return {
-        "order": order,
-        "references": references,
-        "basis": basis,
-        "yaw_axis": yaw_axis,
-        "pitch_axis": pitch_axis,
-        "demix": demix,
-        "ranges": {"yaw": {"open": yaw_open, "close": yaw_close}, "pitch": {"open": pitch_open, "close": pitch_close}},
-        "metrics": metrics,
-        "selection_score": float(score),
-    }
+    # Fisher-style directions use the continuous sweeps as negative examples:
+    # yaw must respond to yaw endpoints while remaining quiet during pitch, and
+    # vice versa. This avoids an unstable endpoint-matrix inversion for the
+    # single physical sensor's derived Hi5 bone rotations.
+    for neutral_weight in (0.1, 0.3, 1.0, 3.0, 10.0):
+        for ridge_ratio in (0.0001, 0.0003, 0.001, 0.003, 0.01):
+            yaw_axis = np.linalg.solve(
+                pitch_covariance + neutral_weight * neutral_covariance + ridge_ratio * scale * identity,
+                yaw_delta,
+            )
+            pitch_axis = np.linalg.solve(
+                yaw_covariance + neutral_weight * neutral_covariance + ridge_ratio * scale * identity,
+                pitch_delta,
+            )
+            yaw_axis /= max(float(np.linalg.norm(yaw_axis)), 1e-12)
+            pitch_axis /= max(float(np.linalg.norm(pitch_axis)), 1e-12)
+            scores = {
+                key: np.column_stack((value @ yaw_axis, value @ pitch_axis))
+                for key, value in matrices.items()
+            }
+            yaw_change = np.mean(scores["yaw_close"], axis=0) - np.mean(scores["yaw_open"], axis=0)
+            pitch_change = np.mean(scores["pitch_close"], axis=0) - np.mean(scores["pitch_open"], axis=0)
+            response = np.column_stack((yaw_change, pitch_change))
+            condition = float(np.linalg.cond(response))
+            if not math.isfinite(condition) or condition > 1000.0:
+                continue
+            yaw_open = float(np.median(scores["yaw_open"][:, 0]))
+            yaw_close = float(np.median(scores["yaw_close"][:, 0]))
+            pitch_open = float(np.median(scores["pitch_open"][:, 1]))
+            pitch_close = float(np.median(scores["pitch_close"][:, 1]))
+            metrics = {
+                "response_condition": condition,
+                "yaw_feature_span": yaw_norm,
+                "pitch_feature_span": pitch_norm,
+                "discriminant_neutral_weight": neutral_weight,
+                "discriminant_ridge_ratio": ridge_ratio,
+                "neutral_validation_yaw_target_range": target_range(scores["neutral_validate"][:, 0], yaw_open, yaw_close),
+                "neutral_validation_pitch_target_range": target_range(scores["neutral_validate"][:, 1], pitch_open, pitch_close),
+                "yaw_sweep_target_range": target_range(scores["yaw_sweep"][:, 0], yaw_open, yaw_close),
+                "yaw_sweep_pitch_crosstalk": target_range(scores["yaw_sweep"][:, 1], pitch_open, pitch_close),
+                "pitch_sweep_target_range": target_range(scores["pitch_sweep"][:, 1], pitch_open, pitch_close),
+                "pitch_sweep_yaw_crosstalk": target_range(scores["pitch_sweep"][:, 0], yaw_open, yaw_close),
+            }
+            metrics["quality_pass"] = bool(
+                min(yaw_norm, pitch_norm) >= 5.0
+                and condition <= 20.0
+                and metrics["neutral_validation_yaw_target_range"] <= 100.0
+                and metrics["neutral_validation_pitch_target_range"] <= 100.0
+                and metrics["yaw_sweep_target_range"] >= 1600.0
+                and metrics["pitch_sweep_target_range"] >= 1600.0
+                and metrics["yaw_sweep_pitch_crosstalk"] <= 100.0
+                and metrics["pitch_sweep_yaw_crosstalk"] <= 100.0
+            )
+            penalty = (
+                metrics["neutral_validation_yaw_target_range"]
+                + metrics["neutral_validation_pitch_target_range"]
+                + metrics["yaw_sweep_pitch_crosstalk"]
+                + metrics["pitch_sweep_yaw_crosstalk"]
+            )
+            reward = metrics["yaw_sweep_target_range"] + metrics["pitch_sweep_target_range"]
+            selection_score = reward - 4.0 * penalty - 10.0 * condition
+            candidates.append({
+                "order": order,
+                "references": references,
+                "yaw_axis": yaw_axis,
+                "pitch_axis": pitch_axis,
+                "demix": np.eye(2),
+                "ranges": {"yaw": {"open": yaw_open, "close": yaw_close}, "pitch": {"open": pitch_open, "close": pitch_close}},
+                "metrics": metrics,
+                "selection_score": float(selection_score),
+            })
+    if not candidates:
+        raise ValueError(f"{order}: no stable discriminant solution")
+    candidates.sort(key=lambda item: (item["metrics"]["quality_pass"], item["selection_score"]), reverse=True)
+    return candidates[0]
 
 
 def calibration_payload(hand: str, fit: dict, sample_counts: Dict[str, int]) -> dict:
     calibration_id = "hi5-thumb-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "calibration_id": calibration_id,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "hand": hand,
-        "source": "hi5_bone_rotation_euler_deg",
+        "source": "hi5_single_sensor_derived_thumb_rotations_euler_deg",
+        "model": "single_thumb_fixed_wrist",
         "euler_order": fit["order"],
         "feature_joint_indices": list(JOINT_INDICES),
-        "feature_joint_names": ["thumb_cmc", "thumb_mcp", "thumb_ip", "index_mcp", "middle_mcp", "ring_mcp", "pinky_mcp"],
+        "feature_joint_names": ["thumb_cmc_derived", "thumb_mcp_derived", "thumb_ip_derived"],
         "reference_quaternions_wxyz": fit["references"].tolist(),
-        "nuisance_basis": fit["basis"].tolist(),
         "yaw_axis": fit["yaw_axis"].tolist(),
         "pitch_axis": fit["pitch_axis"].tolist(),
         "demix_matrix": fit["demix"].tolist(),
@@ -303,6 +308,11 @@ def calibration_payload(hand: str, fit: dict, sample_counts: Dict[str, int]) -> 
         "quality": fit["metrics"],
         "sample_counts": sample_counts,
     }
+
+
+def save_samples(path: Path, samples: Dict[str, List[np.ndarray]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **{key: np.stack(value) for key, value in samples.items()})
 
 
 def main() -> int:
@@ -314,22 +324,34 @@ def main() -> int:
     parser.add_argument("--duration", type=float, help="override every state duration for a quick dry run")
     parser.add_argument("--output", default=str(default_output))
     parser.add_argument("--diagnostics", help="diagnostic JSON path; defaults next to output")
+    parser.add_argument("--samples", help="raw NPZ sample path; defaults next to output")
+    parser.add_argument("--from-samples", type=Path, help="refit an existing raw NPZ without collecting UDP data")
     args = parser.parse_args()
 
     output = Path(args.output).resolve()
     diagnostics = Path(args.diagnostics).resolve() if args.diagnostics else output.with_name("thumb_glove_calibration_diagnostics.json")
+    samples_path = Path(args.samples).resolve() if args.samples else output.with_name("thumb_glove_calibration_samples.npz")
     print("=== Hi5 右手套拇指 rotation-only 标定 ===")
-    print("请先停止 udp_receiver_unity.exe；Unity/Hi5 发送程序保持运行。")
-    print(f"监听 {args.ip}:{args.port}，手侧={args.hand}")
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((args.ip, args.port))
-    samples: Dict[str, List[np.ndarray]] = {}
-    try:
-        for state in STATES:
-            samples[state.key] = collect_state(sock, args.hand, state, args.duration)
-    finally:
-        sock.close()
+    if args.from_samples:
+        with np.load(args.from_samples.resolve()) as archive:
+            samples = {key: [frame for frame in archive[key]] for key in archive.files}
+        missing = [state.key for state in STATES if state.key not in samples]
+        if missing:
+            raise RuntimeError("原始样本缺少阶段: " + ", ".join(missing))
+        print(f"重新拟合原始样本: {args.from_samples.resolve()}")
+    else:
+        print("请先停止 udp_receiver_unity.exe；Unity/Hi5 发送程序保持运行。")
+        print(f"监听 {args.ip}:{args.port}，手侧={args.hand}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((args.ip, args.port))
+        samples = {}
+        try:
+            for state in STATES:
+                samples[state.key] = collect_state(sock, args.hand, state, args.duration)
+        finally:
+            sock.close()
+        save_samples(samples_path, samples)
+        print(f"原始样本: {samples_path}")
 
     candidates = []
     failures = []

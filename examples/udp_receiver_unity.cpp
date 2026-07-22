@@ -503,7 +503,7 @@ static bool ReadFixedVector(
     std::string& error,
     const char* name) {
     if (!value.is_array() || value.size() != glove_thumb::kFeatureDimension) {
-        error = std::string(name) + " must contain 21 numbers";
+        error = std::string(name) + " must contain 9 numbers";
         return false;
     }
     for (std::size_t index = 0; index < output.size(); ++index) {
@@ -530,11 +530,15 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
         calibration.schema_version = root.at("schema_version").get<int>();
         calibration.calibration_id = root.at("calibration_id").get<std::string>();
         calibration.hand = root.at("hand").get<std::string>();
+        if (root.at("model").get<std::string>() != "single_thumb_fixed_wrist") {
+            error = "unsupported thumb calibration model";
+            return false;
+        }
         calibration.euler_order = root.at("euler_order").get<std::string>();
 
         const auto& joints = root.at("feature_joint_indices");
         if (!joints.is_array() || joints.size() != glove_thumb::kSelectedJointCount) {
-            error = "feature_joint_indices must contain 7 integers";
+            error = "feature_joint_indices must contain 3 integers";
             return false;
         }
         for (std::size_t index = 0; index < calibration.joint_indices.size(); ++index) {
@@ -543,7 +547,7 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
 
         const auto& references = root.at("reference_quaternions_wxyz");
         if (!references.is_array() || references.size() != glove_thumb::kSelectedJointCount) {
-            error = "reference_quaternions_wxyz must contain 7 quaternions";
+            error = "reference_quaternions_wxyz must contain 3 quaternions";
             return false;
         }
         for (std::size_t index = 0; index < calibration.reference_quaternions.size(); ++index) {
@@ -556,16 +560,6 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
                 values[0].get<double>(), values[1].get<double>(), values[2].get<double>(), values[3].get<double>()};
         }
 
-        const auto& nuisance = root.at("nuisance_basis");
-        if (!nuisance.is_array()) {
-            error = "nuisance_basis must be an array";
-            return false;
-        }
-        for (const auto& row : nuisance) {
-            std::array<double, glove_thumb::kFeatureDimension> vector{};
-            if (!ReadFixedVector(row, vector, error, "nuisance_basis row")) return false;
-            calibration.nuisance_basis.push_back(vector);
-        }
         if (!ReadFixedVector(root.at("yaw_axis"), calibration.yaw_axis, error, "yaw_axis")) return false;
         if (!ReadFixedVector(root.at("pitch_axis"), calibration.pitch_axis, error, "pitch_axis")) return false;
 

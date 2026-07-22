@@ -123,7 +123,7 @@ bool Mapper::Configure(const Calibration& input, std::string* error) {
         return false;
     };
 
-    if (input.schema_version != 1) return fail("unsupported schema_version");
+    if (input.schema_version != 2) return fail("unsupported schema_version");
     if (input.hand != "left" && input.hand != "right") return fail("hand must be left or right");
     if (!ValidOrder(input.euler_order)) return fail("euler_order must contain x, y and z exactly once");
     if (input.calibration_id.empty()) return fail("calibration_id is empty");
@@ -149,32 +149,10 @@ bool Mapper::Configure(const Calibration& input, std::string* error) {
     calibration_ = input;
     for (Quaternion& reference : calibration_.reference_quaternions) reference = NormalizeQuaternion(reference);
 
-    // Gram-Schmidt makes the runtime projection well defined even if the JSON
-    // contains a slightly non-orthogonal PCA basis due to serialization.
-    std::vector<std::array<double, kFeatureDimension>> orthonormal_basis;
-    for (auto vector : input.nuisance_basis) {
-        for (double value : vector) if (!Finite(value)) return fail("non-finite nuisance basis");
-        for (const auto& accepted : orthonormal_basis) {
-            const double projection = Dot(vector, accepted);
-            for (std::size_t i = 0; i < kFeatureDimension; ++i) vector[i] -= projection * accepted[i];
-        }
-        const double norm = Norm(vector);
-        if (norm > 1e-8) {
-            for (double& value : vector) value /= norm;
-            orthonormal_basis.push_back(vector);
-        }
-    }
-    calibration_.nuisance_basis = orthonormal_basis;
-
     auto normalize_axis = [&](std::array<double, kFeatureDimension>& axis, const char* name) {
         for (double value : axis) if (!Finite(value)) return fail(std::string("non-finite ") + name);
-        // The learned action axes must themselves be outside the nuisance space.
-        for (const auto& nuisance : calibration_.nuisance_basis) {
-            const double projection = Dot(axis, nuisance);
-            for (std::size_t i = 0; i < kFeatureDimension; ++i) axis[i] -= projection * nuisance[i];
-        }
         const double norm = Norm(axis);
-        if (norm < 1e-8) return fail(std::string(name) + " is degenerate after nuisance projection");
+        if (norm < 1e-8) return fail(std::string(name) + " is degenerate");
         for (double& value : axis) value /= norm;
         return true;
     };
@@ -211,17 +189,12 @@ MappingDebug Mapper::Map(const std::vector<EulerDeg>& rotations) const {
             return debug;
         }
         const Quaternion current = EulerToQuaternion(euler, calibration_.euler_order);
-        const Quaternion delta = NormalizeQuaternion(Multiply(Conjugate(calibration_.reference_quaternions[selected]), current));
-        const auto log = QuaternionLogDegrees(delta);
+        const Quaternion relative = NormalizeQuaternion(Multiply(
+            Conjugate(calibration_.reference_quaternions[selected]), current));
+        const auto log = QuaternionLogDegrees(relative);
         for (std::size_t axis = 0; axis < 3; ++axis) feature[selected * 3 + axis] = log[axis];
     }
-
-    std::array<double, kFeatureDimension> residual = feature;
-    for (const auto& nuisance : calibration_.nuisance_basis) {
-        const double projection = Dot(residual, nuisance);
-        for (std::size_t index = 0; index < kFeatureDimension; ++index) residual[index] -= projection * nuisance[index];
-    }
-
+    const std::array<double, kFeatureDimension>& residual = feature;
     debug.feature_norm = Norm(feature);
     debug.residual_norm = Norm(residual);
     debug.yaw_projected = Dot(residual, calibration_.yaw_axis);

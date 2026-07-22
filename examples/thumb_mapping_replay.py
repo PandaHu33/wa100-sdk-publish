@@ -13,10 +13,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from thumb_calibration import euler_to_quaternion, quaternion_log_deg, multiply
-
-
-JOINT_INDICES = (1, 2, 3, 5, 9, 13, 17)
+from thumb_calibration import conjugate, euler_to_quaternion, quaternion_log_deg, multiply
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -78,7 +75,7 @@ def legacy_fingers(rot: Sequence[float], previous: List[int]) -> List[int]:
 
 def load_calibration(path: Path) -> dict:
     config = json.loads(path.read_text(encoding="utf-8"))
-    if config.get("schema_version") != 1:
+    if config.get("schema_version") != 2 or config.get("model") != "single_thumb_fixed_wrist":
         raise ValueError("unsupported calibration schema")
     return config
 
@@ -89,13 +86,10 @@ def calibrated_thumb(rot: Sequence[float], config: dict) -> Tuple[float, float, 
     row = []
     for selected, joint in enumerate(config["feature_joint_indices"]):
         current = euler_to_quaternion(rot[joint * 3 : joint * 3 + 3], order)
-        reference = references[selected]
-        delta = multiply(np.array([reference[0], -reference[1], -reference[2], -reference[3]]), current)
-        row.extend(quaternion_log_deg(delta))
+        relative = multiply(conjugate(references[selected]), current)
+        row.extend(quaternion_log_deg(relative))
     feature = np.asarray(row, dtype=float)
-    basis = np.asarray(config["nuisance_basis"], dtype=float)
-    residual = feature if basis.size == 0 else feature - (feature @ basis.T) @ basis
-    projected = np.array([residual @ np.asarray(config["yaw_axis"]), residual @ np.asarray(config["pitch_axis"])])
+    projected = np.array([feature @ np.asarray(config["yaw_axis"]), feature @ np.asarray(config["pitch_axis"])])
     scores = np.asarray(config["demix_matrix"], dtype=float) @ projected
 
     def map_one(score: float, channel: str) -> Tuple[float, int]:

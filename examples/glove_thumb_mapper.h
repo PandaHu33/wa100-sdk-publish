@@ -7,7 +7,7 @@
 
 namespace glove_thumb {
 
-constexpr std::size_t kSelectedJointCount = 7;
+constexpr std::size_t kSelectedJointCount = 3;
 constexpr std::size_t kFeatureDimension = kSelectedJointCount * 3;
 
 struct EulerDeg {
@@ -24,13 +24,12 @@ struct Quaternion {
 };
 
 struct Calibration {
-    int schema_version = 1;
+    int schema_version = 2;
     std::string calibration_id;
     std::string hand = "right";
     std::string euler_order = "zxy";
-    std::array<int, kSelectedJointCount> joint_indices{{1, 2, 3, 5, 9, 13, 17}};
+    std::array<int, kSelectedJointCount> joint_indices{{1, 2, 3}};
     std::array<Quaternion, kSelectedJointCount> reference_quaternions{};
-    std::vector<std::array<double, kFeatureDimension>> nuisance_basis;
     std::array<double, kFeatureDimension> yaw_axis{};
     std::array<double, kFeatureDimension> pitch_axis{};
     std::array<std::array<double, 2>, 2> demix{{{{1.0, 0.0}}, {{0.0, 1.0}}}};

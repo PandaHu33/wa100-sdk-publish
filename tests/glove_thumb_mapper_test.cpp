@@ -99,6 +99,37 @@ void TestInvalidCalibrationFailsSafe() {
     Require(result.yaw_target == 2000 && result.pitch_target == 2000, "unconfigured mapper must fail safe open");
 }
 
+void TestManualOutputTargetsAreApplied() {
+    Calibration calibration = BaseCalibration();
+    calibration.open_target = 1800;
+    calibration.close_target = 200;
+    Mapper mapper;
+    std::string error;
+    Require(mapper.Configure(calibration, &error), "manual output calibration: " + error);
+
+    const auto opened = mapper.Map(NeutralRotations());
+    Require(opened.yaw_target == 1800 && opened.pitch_target == 1800,
+            "custom open target must apply to both thumb channels");
+    auto closed = NeutralRotations();
+    closed[1].y = 30.0;
+    closed[3].z = 30.0;
+    const auto closed_result = mapper.Map(closed);
+    Require(closed_result.yaw_target == 200 && closed_result.pitch_target == 200,
+            "custom close target must apply to both thumb channels");
+}
+
+void TestFingerStyleScalarPitchMapping() {
+    const double opened = Mapper::MapScalarRatio(30.0, 30.0, 50.0, 0.06, 0.12);
+    const double middle = Mapper::MapScalarRatio(40.0, 30.0, 50.0, 0.06, 0.12);
+    const double closed = Mapper::MapScalarRatio(50.0, 30.0, 50.0, 0.06, 0.12);
+    Require(opened == 0.0, "magnitude open endpoint must map to open ratio");
+    Require(middle > 0.5 && middle < 0.6,
+            "magnitude midpoint must follow the asymmetric finger deadzones");
+    Require(closed == 1.0, "magnitude close endpoint must map to close ratio");
+    Require(Mapper::RatioToTarget(opened, 2000, 0) == 2000, "open magnitude must command open");
+    Require(Mapper::RatioToTarget(closed, 2000, 0) == 0, "closed magnitude must command close");
+}
+
 }  // namespace
 
 int main() {
@@ -106,6 +137,8 @@ int main() {
     TestNeutralPoseIsOpen();
     TestYawAndPitchAreIndependent();
     TestInvalidCalibrationFailsSafe();
+    TestManualOutputTargetsAreApplied();
+    TestFingerStyleScalarPitchMapping();
     std::cout << "glove_thumb_mapper_test: PASS" << std::endl;
     return 0;
 }

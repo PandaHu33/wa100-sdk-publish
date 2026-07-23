@@ -8,6 +8,7 @@
 #include "wa100_fast_driver.h"
 #include "json.hpp"
 #include "glove_thumb_mapper.h"
+#include "wa100_feedback_filter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <limits>
@@ -33,6 +35,7 @@ using json = nlohmann::json;
 #define PORT 25001
 #define RECORDING_TELEMETRY_IP "127.0.0.1"
 #define RECORDING_TELEMETRY_PORT 25003
+#define SENSOR_ALIGNMENT_GLOVE_PORT 25005
 #define BUFFER_SIZE 65536
 #define MAX_UDP_DRAIN_PER_TICK 16
 
@@ -92,6 +95,7 @@ UnityHandSide g_unity_hand_side = UnityHandSide::Right;
 glove_thumb::Mapper g_glove_thumb_mapper;
 glove_thumb::MappingDebug g_last_thumb_mapping_debug;
 std::string g_thumb_calibration_path;
+bool g_thumb_calibration_hot_reload = false;
 
 WA100FastDriver g_fast_driver;
 
@@ -128,7 +132,7 @@ const double CURRENT_FILTER_ALPHA = 0.25;
 const double DESIRED_SLEW_RATE = 4500.0;
 const double MAX_ADMITTANCE_VEL = 3500.0;
 const double MAX_ADMITTANCE_OFFSET = 1800.0;
-const uint16_t INVALID_POSITION_THRESHOLD = 10000;
+const uint16_t INVALID_CURRENT_THRESHOLD = 10000;
 
 struct SecondOrderState {
     double offset = 0.0;
@@ -583,13 +587,17 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
         if (root.contains("mapping")) {
             calibration.open_deadzone = root["mapping"].value("open_deadzone", calibration.open_deadzone);
             calibration.close_deadzone = root["mapping"].value("close_deadzone", calibration.close_deadzone);
+            calibration.open_target = root["mapping"].value("open_target", calibration.open_target);
+            calibration.close_target = root["mapping"].value("close_target", calibration.close_target);
         }
-
         if (calibration.hand != HandSideToString(g_unity_hand_side)) {
             error = "calibration hand does not match selected Unity hand";
             return false;
         }
-        return g_glove_thumb_mapper.Configure(calibration, &error);
+        glove_thumb::Mapper candidate;
+        if (!candidate.Configure(calibration, &error)) return false;
+        g_glove_thumb_mapper = candidate;
+        return true;
     } catch (const std::exception& exception) {
         error = std::string("invalid calibration JSON: ") + exception.what();
         return false;
@@ -600,6 +608,15 @@ static std::string ExecutableDirectory(const char* argv0) {
     const std::string path = argv0 == nullptr ? std::string() : std::string(argv0);
     const std::size_t separator = path.find_last_of("\\/");
     return separator == std::string::npos ? std::string(".") : path.substr(0, separator);
+}
+
+static std::string ThumbBoundarySummary(const glove_thumb::Calibration& calibration) {
+    std::ostringstream output;
+    output << "yaw[" << calibration.yaw_open_score << "," << calibration.yaw_close_score << "] "
+           << "pitch[" << calibration.pitch_open_score << "," << calibration.pitch_close_score << "] "
+           << "deadzone[" << calibration.open_deadzone << "," << calibration.close_deadzone << "] "
+           << "target[" << calibration.open_target << "->" << calibration.close_target << "]";
+    return output.str();
 }
 
 static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& handled) {
@@ -674,12 +691,14 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         return false;
     }
 
+    Vec3 thumb_mcp_r;
     Vec3 index_mcp_r, index_pip_r;
     Vec3 middle_mcp_r, middle_pip_r;
     Vec3 ring_mcp_r, ring_pip_r;
     Vec3 pinky_mcp_r, pinky_pip_r;
 
-    if (!GetJoint(hand_rot, 5, index_mcp_r) || !GetJoint(hand_rot, 6, index_pip_r) || !GetJoint(hand_rot, 9, middle_mcp_r) ||
+    if (!GetJoint(hand_rot, 2, thumb_mcp_r) ||
+        !GetJoint(hand_rot, 5, index_mcp_r) || !GetJoint(hand_rot, 6, index_pip_r) || !GetJoint(hand_rot, 9, middle_mcp_r) ||
         !GetJoint(hand_rot, 10, middle_pip_r) || !GetJoint(hand_rot, 13, ring_mcp_r) || !GetJoint(hand_rot, 14, ring_pip_r) ||
         !GetJoint(hand_rot, 17, pinky_mcp_r) || !GetJoint(hand_rot, 18, pinky_pip_r)) {
         return false;
@@ -698,7 +717,30 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     g_last_thumb_mapping_debug = g_glove_thumb_mapper.Map(rotations);
     // Missing or invalid calibration fails safe for the two thumb motors only.
     out_targets[0] = g_last_thumb_mapping_debug.valid ? g_last_thumb_mapping_debug.yaw_target : 2000;
-    out_targets[1] = g_last_thumb_mapping_debug.valid ? g_last_thumb_mapping_debug.pitch_target : 2000;
+    if (g_last_thumb_mapping_debug.valid) {
+        // The glove has only one physical thumb sensor. Keep calibrated quaternion
+        // projection for yaw, but calculate flexion like index-to-pinky from the
+        // available sensor's rotation magnitude. Do not weight two derived thumb
+        // bones as though they were independent physical sensors. This avoids asking one
+        // linear two-axis demixer to explain the combined yaw+flexion pose.
+        const double thumb_pitch_feature = rot_mag(thumb_mcp_r);
+        const auto& calibration = g_glove_thumb_mapper.calibration();
+        const double thumb_pitch_ratio = glove_thumb::Mapper::MapScalarRatio(
+            thumb_pitch_feature,
+            calibration.pitch_open_score,
+            calibration.pitch_close_score,
+            calibration.open_deadzone,
+            calibration.close_deadzone);
+        const uint16_t thumb_pitch_target = glove_thumb::Mapper::RatioToTarget(
+            thumb_pitch_ratio, calibration.open_target, calibration.close_target);
+        g_last_thumb_mapping_debug.pitch_projected = thumb_pitch_feature;
+        g_last_thumb_mapping_debug.pitch_score = thumb_pitch_feature;
+        g_last_thumb_mapping_debug.pitch_ratio = thumb_pitch_ratio;
+        g_last_thumb_mapping_debug.pitch_target = thumb_pitch_target;
+        out_targets[1] = thumb_pitch_target;
+    } else {
+        out_targets[1] = 2000;
+    }
 
     // Fingers: use weighted MCP/PIP rotation magnitude
     double idx_feature = 0.35 * rot_mag(index_mcp_r) + 0.65 * rot_mag(index_pip_r);
@@ -802,6 +844,8 @@ void ComplianceControlLoop() {
     uint16_t shaped_desired[6];
     uint16_t last_valid_pos[6] = {0};
     bool position_feedback_valid[6] = {false};
+    bool position_zero_wrap_corrected[6] = {false};
+    bool current_feedback_valid[6] = {false};
     bool local_soft_release_active[6] = {false};
 
     SecondOrderState states[6];
@@ -865,21 +909,41 @@ void ComplianceControlLoop() {
         }
 
         for (int i = 0; i < 6; i++) {
-            // Filter out clearly invalid position feedback such as 0xFFFF.
-            // Small overshoot around 2000 is still considered valid.
-            position_feedback_valid[i] = feedback_valid && current_pos[i] <= INVALID_POSITION_THRESHOLD;
+            const uint16_t raw_position = current_pos[i];
+            const auto normalized_position = wa100_feedback::NormalizePosition(
+                raw_position, last_valid_pos[i], feedback_valid);
+            current_pos[i] = normalized_position.position;
+            position_feedback_valid[i] = normalized_position.valid;
+            position_zero_wrap_corrected[i] = normalized_position.zero_wrap_corrected;
+            current_feedback_valid[i] = feedback_valid && current_amp[i] <= INVALID_CURRENT_THRESHOLD;
             if (position_feedback_valid[i]) {
                 last_valid_pos[i] = current_pos[i];
+                if (position_zero_wrap_corrected[i]) {
+                    static int zero_wrap_log_limit[6] = {0};
+                    if (zero_wrap_log_limit[i]++ % 100 == 0) {
+                        std::cerr << ">>> [Position Zero Wrap] ID " << i + 1 << " raw "
+                                  << raw_position << " normalized to 0" << std::endl;
+                    }
+                }
             } else {
                 static int invalid_pos_log_limit[6] = {0};
                 if (invalid_pos_log_limit[i]++ % 50 == 0) {
                     std::cerr << ">>> [Position Filter] ID " << i + 1 << " invalid real position "
-                              << current_pos[i] << ", using last valid " << last_valid_pos[i] << std::endl;
+                              << raw_position << ", desired " << desired_pos[i]
+                              << ", final command " << final_cmd[i]
+                              << ", using last valid " << last_valid_pos[i] << std::endl;
                 }
-                current_pos[i] = last_valid_pos[i];
             }
 
-            filtered_amp[i] += ((double)current_amp[i] - filtered_amp[i]) * CURRENT_FILTER_ALPHA;
+            if (current_feedback_valid[i]) {
+                filtered_amp[i] += ((double)current_amp[i] - filtered_amp[i]) * CURRENT_FILTER_ALPHA;
+            } else {
+                static int invalid_current_log_limit[6] = {0};
+                if (invalid_current_log_limit[i]++ % 50 == 0) {
+                    std::cerr << ">>> [Current Filter] ID " << i + 1 << " invalid current "
+                              << current_amp[i] << ", keeping filtered " << filtered_amp[i] << std::endl;
+                }
+            }
 
             double max_step = DESIRED_SLEW_RATE * real_dt;
             double delta = (double)desired_pos[i] - desired_filters[i];
@@ -887,8 +951,8 @@ void ComplianceControlLoop() {
             desired_filters[i] += delta;
             shaped_desired[i] = Clamp((int)std::lround(desired_filters[i]), 0, 2000);
 
-            local_soft_release_active[i] =
-                current_amp[i] > SOFT_CURRENT_RELEASE_MA || filtered_amp[i] > SOFT_CURRENT_RELEASE_MA;
+            local_soft_release_active[i] = current_feedback_valid[i] &&
+                (current_amp[i] > SOFT_CURRENT_RELEASE_MA || filtered_amp[i] > SOFT_CURRENT_RELEASE_MA);
             if (local_soft_release_active[i]) {
                 states[i].offset = (double)((int)current_pos[i] - (int)shaped_desired[i]);
                 states[i].velocity = 0.0;
@@ -905,10 +969,12 @@ void ComplianceControlLoop() {
             int trigger_off = FORCE_THRESHOLD - 200;
             if (trigger_off < 0) trigger_off = 0;
 
-            if (filtered_amp[i] > trigger_on)
-                force_trigger_state[i] = true;
-            else if (filtered_amp[i] < trigger_off)
-                force_trigger_state[i] = false;
+            if (current_feedback_valid[i]) {
+                if (filtered_amp[i] > trigger_on)
+                    force_trigger_state[i] = true;
+                else if (filtered_amp[i] < trigger_off)
+                    force_trigger_state[i] = false;
+            }
 
             if (force_trigger_state[i]) {
                 // Tendon-driven one-way admittance:
@@ -983,6 +1049,9 @@ void ComplianceControlLoop() {
             telemetry["control_mode"] = ControlModeToString((ControlMode)g_control_mode.load());
             telemetry["feedback_valid"] = feedback_valid;
             telemetry["position_valid"] = std::vector<bool>(position_feedback_valid, position_feedback_valid + 6);
+            telemetry["position_zero_wrap_corrected"] =
+                std::vector<bool>(position_zero_wrap_corrected, position_zero_wrap_corrected + 6);
+            telemetry["current_valid"] = std::vector<bool>(current_feedback_valid, current_feedback_valid + 6);
             telemetry["actual_position_units"] = std::vector<uint16_t>(current_pos, current_pos + 6);
             telemetry["target_position_units"] = std::vector<uint16_t>(desired_pos, desired_pos + 6);
             telemetry["command_position_units"] = std::vector<uint16_t>(final_cmd, final_cmd + 6);
@@ -1068,6 +1137,10 @@ int main(int argc, char* argv[]) {
             g_thumb_calibration_path = arg.substr(20);
             continue;
         }
+        if (arg == "--thumb-hot-reload") {
+            g_thumb_calibration_hot_reload = true;
+            continue;
+        }
         if (LooksLikeComPort(arg)) {
             serial_settings.port = arg;
             explicit_serial_override = true;
@@ -1075,7 +1148,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::cerr << "Usage: udp_receiver_unity [left|right] [COMx] [--port COMx] [--baud 1000000] "
-                     "[--thumb-calibration path.json]" << std::endl;
+                     "[--thumb-calibration path.json] [--thumb-hot-reload]" << std::endl;
         return -1;
     }
 
@@ -1083,6 +1156,13 @@ int main(int argc, char* argv[]) {
     if (LoadGloveThumbCalibration(g_thumb_calibration_path, thumb_calibration_error)) {
         std::cout << ">>> Glove thumb calibration: " << g_thumb_calibration_path
                   << " (" << g_glove_thumb_mapper.calibration().calibration_id << ")" << std::endl;
+        std::cout << ">>> Thumb boundaries: "
+                  << ThumbBoundarySummary(g_glove_thumb_mapper.calibration()) << std::endl;
+        if (g_thumb_calibration_hot_reload) {
+            std::cout << ">>> Thumb calibration mode: online hot reload (0.5s)" << std::endl;
+        } else {
+            std::cout << ">>> Thumb calibration mode: static JSON (loaded once at startup)" << std::endl;
+        }
     } else {
         std::cerr << ">>> WARNING: glove thumb calibration inactive: " << thumb_calibration_error << std::endl;
         std::cerr << ">>> Thumb yaw/pitch will stay at safe-open 2000; index-to-pinky mapping remains active." << std::endl;
@@ -1215,6 +1295,13 @@ int main(int argc, char* argv[]) {
     uint16_t latest_valid_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
     int dropped_packet_log_counter = 0;
     std::ofstream unity_input_log;
+    SOCKET alignment_glove_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in alignment_glove_address{};
+    alignment_glove_address.sin_family = AF_INET;
+    alignment_glove_address.sin_port = htons(SENSOR_ALIGNMENT_GLOVE_PORT);
+    alignment_glove_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
+    auto next_thumb_calibration_reload = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    std::string last_thumb_reload_error;
     if (IsUnityInputLoggingEnabled()) {
         const std::string input_log_path = GetLogPath("WA100_UNITY_INPUT_LOG_PATH", "unity_input_log.jsonl");
         unity_input_log.open(input_log_path, std::ios::out | std::ios::app);
@@ -1225,6 +1312,25 @@ int main(int argc, char* argv[]) {
         }
     }
     while (true) {
+        const auto reload_now = std::chrono::steady_clock::now();
+        if (g_thumb_calibration_hot_reload && reload_now >= next_thumb_calibration_reload) {
+            const bool had_calibration = g_glove_thumb_mapper.configured();
+            const std::string previous_summary = had_calibration
+                ? ThumbBoundarySummary(g_glove_thumb_mapper.calibration()) : std::string();
+            std::string reload_error;
+            if (LoadGloveThumbCalibration(g_thumb_calibration_path, reload_error)) {
+                const std::string current_summary = ThumbBoundarySummary(g_glove_thumb_mapper.calibration());
+                if (!had_calibration || current_summary != previous_summary) {
+                    std::cout << ">>> [Thumb Hot Reload] applied: " << current_summary << std::endl;
+                }
+                last_thumb_reload_error.clear();
+            } else if (reload_error != last_thumb_reload_error) {
+                std::cerr << ">>> [Thumb Hot Reload] rejected; keeping last valid configuration: "
+                          << reload_error << std::endl;
+                last_thumb_reload_error = reload_error;
+            }
+            next_thumb_calibration_reload = reload_now + std::chrono::milliseconds(500);
+        }
         int len = recvfrom(server_fd, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&client_addr, &client_len);
         if (len > 0) {
             bool got_valid = false;
@@ -1256,6 +1362,30 @@ int main(int argc, char* argv[]) {
                 if (accepted) {
                     memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
                     got_valid = true;
+                    if (alignment_glove_socket != INVALID_SOCKET) {
+                        // Read-only mirror for controller/glove time-space calibration.
+                        // Add the PC receive clock so it is directly comparable with
+                        // Hand_Tracker's controller receive clock.
+                        try {
+                            json alignment_packet = json::parse(std::string(packet, packet + packet_len));
+                            const char* rotation_key = g_unity_hand_side == UnityHandSide::Left
+                                ? "leftRotations" : "rightRotations";
+                            if (alignment_packet.contains(rotation_key)) {
+                                alignment_packet["type"] = "glove_sensor_frame";
+                                alignment_packet["schema_version"] = 1;
+                                alignment_packet["receiver_wall_time_ns"] = GetCurrentTimeNs();
+                                const std::string encoded_alignment = alignment_packet.dump();
+                                sendto(
+                                    alignment_glove_socket, encoded_alignment.data(),
+                                    static_cast<int>(encoded_alignment.size()), 0,
+                                    reinterpret_cast<const sockaddr*>(&alignment_glove_address),
+                                    sizeof(alignment_glove_address));
+                            }
+                        } catch (...) {
+                            // The normal control path already accepted this packet;
+                            // alignment telemetry must never affect control.
+                        }
+                    }
                 }
             };
 
@@ -1298,6 +1428,7 @@ int main(int argc, char* argv[]) {
     control_thread.join();
 
     closesocket(server_fd);
+    if (alignment_glove_socket != INVALID_SOCKET) closesocket(alignment_glove_socket);
     WSACleanup();
     return 0;
 }

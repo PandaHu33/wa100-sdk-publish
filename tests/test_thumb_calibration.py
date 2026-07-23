@@ -15,7 +15,7 @@ def sample(common=(0.0, 0.0, 0.0), yaw=0.0, pitch=0.0):
     value = np.zeros((len(JOINT_INDICES), 3), dtype=float)
     value += np.asarray(common, dtype=float)
     value[0, 1] += yaw
-    value[2, 2] += pitch
+    value[1, 2] += pitch
     return value
 
 
@@ -57,6 +57,7 @@ class ThumbCalibrationTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["hand"], "right")
         self.assertEqual(payload["model"], "single_thumb_fixed_wrist")
+        self.assertEqual(payload["pitch_feature"]["model"], "single_sensor_euler_rotation_magnitude")
         self.assertEqual(len(payload["yaw_axis"]), 9)
         self.assertEqual(np.asarray(payload["demix_matrix"]).shape, (2, 2))
         self.assertTrue(payload["quality"]["quality_pass"])

@@ -10,3 +10,10 @@ __pycache__/
 /build_root/
 admittance_log.csv
 admittance_log*.csv
+
+### Local identification / calibration experiments
+/examples/GLOVE_CONTROLLER_ALIGNMENT.md
+/examples/glove_controller_alignment.py
+/examples/glove_controller_alignment_gui.py
+/examples/thumb_boundary_tuner.py
+/tests/test_glove_controller_alignment.py

@@ -163,6 +163,12 @@ add_executable(glove_thumb_mapper_test
 target_include_directories(glove_thumb_mapper_test PRIVATE ${EXAMPLES_DIR})
 add_test(NAME glove_thumb_mapper_test COMMAND glove_thumb_mapper_test)
 
+add_executable(wa100_feedback_filter_test
+    ${SDK_ROOT_DIR}/tests/wa100_feedback_filter_test.cpp
+)
+target_include_directories(wa100_feedback_filter_test PRIVATE ${EXAMPLES_DIR})
+add_test(NAME wa100_feedback_filter_test COMMAND wa100_feedback_filter_test)
+
 # ========== 安装规则 ==========
 install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver udp_receiver_unity
     RUNTIME DESTINATION bin

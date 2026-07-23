@@ -54,11 +54,6 @@ double Clamp01(double value) {
     return std::max(0.0, std::min(1.0, value));
 }
 
-uint16_t RatioToTarget(double ratio) {
-    const double target = 2000.0 * (1.0 - Clamp01(ratio));
-    return static_cast<uint16_t>(std::lround(std::max(0.0, std::min(2000.0, target))));
-}
-
 bool ValidOrder(const std::string& order) {
     if (order.size() != 3) return false;
     std::string sorted = order;
@@ -98,17 +93,23 @@ double Mapper::Norm(const std::array<double, kFeatureDimension>& value) {
     return std::sqrt(std::max(0.0, Dot(value, value)));
 }
 
-double Mapper::MapRatio(
-    double score,
-    double open_score,
-    double close_score,
+double Mapper::MapScalarRatio(
+    double value,
+    double open_value,
+    double close_value,
     double open_deadzone,
     double close_deadzone) {
-    double ratio = Clamp01((score - open_score) / (close_score - open_score));
+    double ratio = Clamp01((value - open_value) / (close_value - open_value));
     if (ratio <= open_deadzone) return 0.0;
     if (ratio >= 1.0 - close_deadzone) return 1.0;
     const double middle = Clamp01((ratio - open_deadzone) / (1.0 - open_deadzone - close_deadzone));
     return middle * middle * (3.0 - 2.0 * middle);
+}
+
+uint16_t Mapper::RatioToTarget(double ratio, uint16_t open_target, uint16_t close_target) {
+    const double target = static_cast<double>(open_target) +
+        (static_cast<double>(close_target) - static_cast<double>(open_target)) * Clamp01(ratio);
+    return static_cast<uint16_t>(std::lround(std::max(0.0, std::min(2000.0, target))));
 }
 
 void Mapper::Reset() {
@@ -130,6 +131,9 @@ bool Mapper::Configure(const Calibration& input, std::string* error) {
     if (!(input.open_deadzone >= 0.0 && input.close_deadzone >= 0.0 &&
           input.open_deadzone + input.close_deadzone < 0.95)) {
         return fail("invalid endpoint deadzones");
+    }
+    if (input.open_target > 2000 || input.close_target > 2000 || input.open_target == input.close_target) {
+        return fail("output targets must be distinct values in 0..2000");
     }
     for (std::size_t index = 0; index < kSelectedJointCount; ++index) {
         if (input.joint_indices[index] < 0 || input.joint_indices[index] >= 21) return fail("joint index out of range");
@@ -201,14 +205,16 @@ MappingDebug Mapper::Map(const std::vector<EulerDeg>& rotations) const {
     debug.pitch_projected = Dot(residual, calibration_.pitch_axis);
     debug.yaw_score = calibration_.demix[0][0] * debug.yaw_projected + calibration_.demix[0][1] * debug.pitch_projected;
     debug.pitch_score = calibration_.demix[1][0] * debug.yaw_projected + calibration_.demix[1][1] * debug.pitch_projected;
-    debug.yaw_ratio = MapRatio(
+    debug.yaw_ratio = MapScalarRatio(
         debug.yaw_score, calibration_.yaw_open_score, calibration_.yaw_close_score,
         calibration_.open_deadzone, calibration_.close_deadzone);
-    debug.pitch_ratio = MapRatio(
+    debug.pitch_ratio = MapScalarRatio(
         debug.pitch_score, calibration_.pitch_open_score, calibration_.pitch_close_score,
         calibration_.open_deadzone, calibration_.close_deadzone);
-    debug.yaw_target = RatioToTarget(debug.yaw_ratio);
-    debug.pitch_target = RatioToTarget(debug.pitch_ratio);
+    debug.yaw_target = Mapper::RatioToTarget(
+        debug.yaw_ratio, calibration_.open_target, calibration_.close_target);
+    debug.pitch_target = Mapper::RatioToTarget(
+        debug.pitch_ratio, calibration_.open_target, calibration_.close_target);
     debug.valid = true;
     return debug;
 }

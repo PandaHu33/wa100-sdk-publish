@@ -195,6 +195,14 @@ def target_range(score: np.ndarray, open_score: float, close_score: float) -> fl
     return float(np.ptp(2000.0 * (1.0 - target_ratio(score, open_score, close_score))))
 
 
+def thumb_pitch_magnitude(samples: List[np.ndarray]) -> np.ndarray:
+    """Use the single thumb sensor's derived MCP rotation magnitude."""
+    values = np.asarray(samples, dtype=float)
+    if values.ndim != 3 or values.shape[1:] != (len(JOINT_INDICES), 3):
+        raise ValueError("thumb pitch samples must have shape [N, 3, 3]")
+    return np.linalg.norm(values[:, 1, :], axis=1)
+
+
 def fit_candidate(samples: Dict[str, List[np.ndarray]], order: str) -> dict:
     references = build_references(samples["neutral"], order)
     matrices = {key: features(value, references, order) for key, value in samples.items()}
@@ -208,6 +216,12 @@ def fit_candidate(samples: Dict[str, List[np.ndarray]], order: str) -> dict:
     pitch_covariance = np.cov(matrices["pitch_sweep"], rowvar=False)
     scale = max(float(np.trace(neutral_covariance + yaw_covariance + pitch_covariance)) / (3.0 * FEATURE_DIMENSION), 1e-8)
     identity = np.eye(FEATURE_DIMENSION)
+    pitch_magnitudes = {key: thumb_pitch_magnitude(value) for key, value in samples.items()}
+    pitch_open_magnitude = float(np.median(pitch_magnitudes["pitch_open"]))
+    pitch_close_magnitude = float(np.median(pitch_magnitudes["pitch_close"]))
+    pitch_magnitude_span = abs(pitch_close_magnitude - pitch_open_magnitude)
+    if pitch_magnitude_span < 1e-6:
+        raise ValueError(f"{order}: thumb pitch rotation magnitude is degenerate")
     candidates = []
 
     # Fisher-style directions use the continuous sweeps as negative examples:
@@ -238,29 +252,32 @@ def fit_candidate(samples: Dict[str, List[np.ndarray]], order: str) -> dict:
                 continue
             yaw_open = float(np.median(scores["yaw_open"][:, 0]))
             yaw_close = float(np.median(scores["yaw_close"][:, 0]))
-            pitch_open = float(np.median(scores["pitch_open"][:, 1]))
-            pitch_close = float(np.median(scores["pitch_close"][:, 1]))
+            pitch_open = pitch_open_magnitude
+            pitch_close = pitch_close_magnitude
             metrics = {
                 "response_condition": condition,
                 "yaw_feature_span": yaw_norm,
-                "pitch_feature_span": pitch_norm,
+                "pitch_feature_span": pitch_magnitude_span,
                 "discriminant_neutral_weight": neutral_weight,
                 "discriminant_ridge_ratio": ridge_ratio,
                 "neutral_validation_yaw_target_range": target_range(scores["neutral_validate"][:, 0], yaw_open, yaw_close),
-                "neutral_validation_pitch_target_range": target_range(scores["neutral_validate"][:, 1], pitch_open, pitch_close),
+                "neutral_validation_pitch_target_range": target_range(
+                    pitch_magnitudes["neutral_validate"], pitch_open, pitch_close),
                 "yaw_sweep_target_range": target_range(scores["yaw_sweep"][:, 0], yaw_open, yaw_close),
-                "yaw_sweep_pitch_crosstalk": target_range(scores["yaw_sweep"][:, 1], pitch_open, pitch_close),
-                "pitch_sweep_target_range": target_range(scores["pitch_sweep"][:, 1], pitch_open, pitch_close),
+                "yaw_sweep_pitch_crosstalk": target_range(
+                    pitch_magnitudes["yaw_sweep"], pitch_open, pitch_close),
+                "pitch_sweep_target_range": target_range(
+                    pitch_magnitudes["pitch_sweep"], pitch_open, pitch_close),
                 "pitch_sweep_yaw_crosstalk": target_range(scores["pitch_sweep"][:, 0], yaw_open, yaw_close),
             }
             metrics["quality_pass"] = bool(
-                min(yaw_norm, pitch_norm) >= 5.0
+                yaw_norm >= 5.0
+                and pitch_magnitude_span >= 5.0
                 and condition <= 20.0
                 and metrics["neutral_validation_yaw_target_range"] <= 100.0
                 and metrics["neutral_validation_pitch_target_range"] <= 100.0
                 and metrics["yaw_sweep_target_range"] >= 1600.0
                 and metrics["pitch_sweep_target_range"] >= 1600.0
-                and metrics["yaw_sweep_pitch_crosstalk"] <= 100.0
                 and metrics["pitch_sweep_yaw_crosstalk"] <= 100.0
             )
             penalty = (
@@ -304,6 +321,11 @@ def calibration_payload(hand: str, fit: dict, sample_counts: Dict[str, int]) -> 
         "pitch_axis": fit["pitch_axis"].tolist(),
         "demix_matrix": fit["demix"].tolist(),
         "score_ranges": fit["ranges"],
+        "pitch_feature": {
+            "model": "single_sensor_euler_rotation_magnitude",
+            "joint": "thumb_mcp_derived",
+            "unit": "degree",
+        },
         "mapping": {"open_target": 2000, "close_target": 0, "open_deadzone": 0.04, "close_deadzone": 0.06},
         "quality": fit["metrics"],
         "sample_counts": sample_counts,

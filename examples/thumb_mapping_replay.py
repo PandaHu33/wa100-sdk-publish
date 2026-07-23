@@ -107,8 +107,10 @@ def calibrated_thumb(rot: Sequence[float], config: dict) -> Tuple[float, float, 
         return mapped, int(round(2000.0 * (1.0 - mapped)))
 
     yaw_ratio, yaw_target = map_one(float(scores[0]), "yaw")
-    pitch_ratio, pitch_target = map_one(float(scores[1]), "pitch")
-    return float(scores[0]), float(scores[1]), yaw_ratio, pitch_ratio, yaw_target, pitch_target
+    thumb_mcp = np.asarray(rot[2 * 3 : 2 * 3 + 3], dtype=float)
+    pitch_magnitude = float(np.linalg.norm(thumb_mcp))
+    pitch_ratio, pitch_target = map_one(pitch_magnitude, "pitch")
+    return float(scores[0]), pitch_magnitude, yaw_ratio, pitch_ratio, yaw_target, pitch_target
 
 
 def load_actual(path: Path | None) -> Tuple[List[int], Dict[int, Dict[int, dict]]]:

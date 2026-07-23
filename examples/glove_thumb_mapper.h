@@ -39,6 +39,8 @@ struct Calibration {
     double pitch_close_score = 1.0;
     double open_deadzone = 0.04;
     double close_deadzone = 0.06;
+    uint16_t open_target = 2000;
+    uint16_t close_target = 0;
 };
 
 struct MappingDebug {
@@ -69,14 +71,19 @@ public:
 
     static Quaternion EulerToQuaternion(const EulerDeg& value, const std::string& order);
     static std::array<double, 3> QuaternionLogDegrees(const Quaternion& value);
+    static double MapScalarRatio(
+        double value,
+        double open_value,
+        double close_value,
+        double open_deadzone,
+        double close_deadzone);
+    static uint16_t RatioToTarget(double ratio, uint16_t open_target, uint16_t close_target);
 
 private:
     static double Dot(
         const std::array<double, kFeatureDimension>& left,
         const std::array<double, kFeatureDimension>& right);
     static double Norm(const std::array<double, kFeatureDimension>& value);
-    static double MapRatio(double score, double open_score, double close_score, double open_deadzone, double close_deadzone);
-
     Calibration calibration_;
     bool configured_ = false;
 };

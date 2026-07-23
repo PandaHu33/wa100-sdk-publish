@@ -1,6 +1,6 @@
 # Hi5 手套拇指 Rotation 标定
 
-本流程只改变手套模式的拇指横摇和弯曲通道。当前基线按“拇指仅一个物理姿态传感器、标定和运行时手腕固定”设计，以中立姿态为参考，对 Hi5 数据包暴露的三个派生拇指骨骼 rotation 做可观测性与解耦标定。食指到小指、VR hand tracking 和预设姿态不使用该标定。
+本流程只改变手套模式的拇指横摇和弯曲通道。当前基线按“拇指仅一个物理姿态传感器、标定和运行时手腕固定”设计。横摇以中立姿态为参考，继续使用 Hi5 三个派生拇指骨骼 rotation 的四元数判别方向；弯曲不再使用同一个线性解耦模型，而是与四指采用相同的 rotation 模长、端点死区和 smoothstep 流程。由于拇指只有一个物理传感器，不把 MCP/IP 两个派生槽位当作独立传感器加权，弯曲特征只取 `thumb_mcp_derived` 的 rotation 模长。食指到小指、VR hand tracking 和预设姿态不使用该标定。
 
 ## 运行标定
 
@@ -20,7 +20,7 @@ python examples/thumb_calibration_gui.py --hand right
 build/bin/thumb_glove_calibration.json
 ```
 
-标定使用连续动作作为反例学习两个判别方向：横摇方向压低弯曲样本方差，弯曲方向压低横摇样本方差。若固定腕姿下中立复测漂移超过 100、任一通道串扰超过 100、横摇或弯曲有效跨度不足 1600，脚本只写诊断文件，不覆盖运行时配置。本基线明确不消除腕部运动；后续接入 VR 手柄后再使用手柄腕姿构造腕部参考系，并与本版对比。
+标定仍学习横摇判别方向；弯曲的开/闭边界直接取弯曲端点样本的单传感器 rotation 模长。由于单个物理传感器无法同时唯一分解横摇和弯曲，弯曲通道不再把“横摇动作造成的弯曲特征变化”作为拒绝标定条件。本基线明确不消除腕部运动；后续接入 VR 手柄后再使用手柄腕姿构造腕部参考系，并与本版对比。
 
 已有原始样本可直接重新拟合，无需再次采集：
 
@@ -35,6 +35,17 @@ python examples/thumb_calibration.py --hand right --from-samples build/bin/thumb
 ```powershell
 build/bin/udp_receiver_unity.exe right
 ```
+
+默认使用静态配置模式：启动时只读取一次可执行文件同目录的 `thumb_glove_calibration.json`，运行期间不会启动标定窗口，也不会热加载文件变化。
+
+只有需要在线调参时，才显式开启热加载并手动启动边界调节窗口：
+
+```powershell
+build/bin/udp_receiver_unity.exe right --thumb-hot-reload
+python examples/thumb_boundary_tuner.py
+```
+
+窗口可分别修改 `yaw.open/close`、`pitch.open/close`、端点死区和 `open_target/close_target`。其中 `yaw` 仍是横摇判别分数，`pitch` 已改为单传感器 rotation 模长（度），两者不是同一单位。点击应用后配置采用原子写入，接收器约 0.5 秒内热加载；无效或写入中的配置不会替换上一份有效参数。
 
 也可以显式指定配置：
 

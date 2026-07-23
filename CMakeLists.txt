@@ -88,7 +88,10 @@ else()
     add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
 endif()
 
-set(WA100_RUNTIME_DIR ${CMAKE_BINARY_DIR}/bin)
+# Keep WA100 runtime artifacts in one canonical location even when CMake is
+# configured from another build tree. This avoids multiple executable copies
+# whose source revisions are difficult to distinguish at runtime.
+set(WA100_RUNTIME_DIR ${SDK_ROOT_DIR}/build/bin)
 
 function(wa100_add_demo target_name source_file)
     add_executable(${target_name} ${source_file})
@@ -144,8 +147,30 @@ if(WIN32)
     target_link_libraries(udp_receiver ws2_32)
 endif()
 
+# 新增 Unity UDP 控制程序（接收Unity JSON并映射为6自由度）
+wa100_add_demo(udp_receiver_unity ${EXAMPLES_DIR}/udp_receiver_unity.cpp)
+target_sources(udp_receiver_unity PRIVATE ${EXAMPLES_DIR}/glove_thumb_mapper.cpp)
+if(WIN32)
+    # Winsock 库链接
+    target_link_libraries(udp_receiver_unity ws2_32)
+endif()
+
+enable_testing()
+add_executable(glove_thumb_mapper_test
+    ${SDK_ROOT_DIR}/tests/glove_thumb_mapper_test.cpp
+    ${EXAMPLES_DIR}/glove_thumb_mapper.cpp
+)
+target_include_directories(glove_thumb_mapper_test PRIVATE ${EXAMPLES_DIR})
+add_test(NAME glove_thumb_mapper_test COMMAND glove_thumb_mapper_test)
+
+add_executable(wa100_feedback_filter_test
+    ${SDK_ROOT_DIR}/tests/wa100_feedback_filter_test.cpp
+)
+target_include_directories(wa100_feedback_filter_test PRIVATE ${EXAMPLES_DIR})
+add_test(NAME wa100_feedback_filter_test COMMAND wa100_feedback_filter_test)
+
 # ========== 安装规则 ==========
-install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver
+install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver udp_receiver_unity
     RUNTIME DESTINATION bin
 )
 
@@ -160,6 +185,6 @@ elseif(UNIX)
 endif()
 
 message(STATUS "")
-message(STATUS "构建目标: basic_demo, advanced_demo, quickstart_demo")
+message(STATUS "构建目标: basic_demo, advanced_demo, quickstart_demo, udp_receiver, udp_receiver_unity")
 message(STATUS "输出目录: ${WA100_RUNTIME_DIR}")
 message(STATUS "========================================")

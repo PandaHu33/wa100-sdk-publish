@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include "wa100_fast_driver.h" // 引入新的高速驱动
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <fstream> // 引入文件流
 #include <thread>
@@ -14,6 +15,8 @@
 #include <vector>
 #include <algorithm> // for std::min, std::max
 #include <chrono>    // Added for timeout handling
+#include <cctype>
+#include <string>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -28,6 +31,18 @@ bool g_running = true;
 
 // 全局驱动实例
 WA100FastDriver g_fast_driver;
+
+bool IsCsvLoggingEnabled() {
+    const char* value = std::getenv("WA100_ENABLE_CSV_LOG");
+    if (value == nullptr) {
+        return false;
+    }
+    std::string flag(value);
+    std::transform(flag.begin(), flag.end(), flag.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return flag == "1" || flag == "true" || flag == "yes" || flag == "on";
+}
 
 // 辅助函数: 获取当前毫秒时间戳
 long long GetCurrentTimeMs() {
@@ -67,12 +82,15 @@ void ComplianceControlLoop() {
     SecondOrderState states[6];
 
     // [新增] 打开 CSV 文件准备写入
-    std::ofstream log_file("admittance_log.csv");
+    std::ofstream log_file;
+    if (IsCsvLoggingEnabled()) {
+        log_file.open("admittance_log.csv");
+    }
     if (log_file.is_open()) {
         // 写入表头
         log_file << "TIME,ID,DESIRED,CMD,REAL,AMP\n";
         std::cout << ">>> 日志文件已创建: admittance_log.csv" << std::endl;
-    } else {
+    } else if (IsCsvLoggingEnabled()) {
         std::cerr << ">>> 警告: 无法创建日志文件" << std::endl;
     }
 

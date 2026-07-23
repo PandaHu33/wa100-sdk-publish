@@ -70,7 +70,9 @@ class HandController:
         t0 = time.time()
         # beta 越小越平滑但滞后越大。0.05 比较平衡
         self.filters = [OneEuroFilter(t0, 0, min_cutoff=0.5, beta=0.05) for _ in range(5)]
-        
+        # [修改] 移除大拇指滤波器，改为突变剔除的状态变量
+        self.last_thumb_raw_yaw = None
+        self.last_thumb_raw_pitch = None
         # 记录每根手指的滤波器是否需要重置
         self.filter_inited = False
 
@@ -143,13 +145,13 @@ class HandController:
         
         # 阈值调整 (根据中指基准微调)
         YAW_OPEN_THRESH  = 0.8  # 大于0.8都算完全张开 (2000)
-        YAW_CLOSE_THRESH = 0.1  # 小于0.1才算完全对掌 (400)
+        YAW_CLOSE_THRESH = 0.1  # 小于0.1才算完全对掌 (0)
         
         yaw_ratio = (norm_yaw - YAW_CLOSE_THRESH) / (YAW_OPEN_THRESH - YAW_CLOSE_THRESH)
         yaw_ratio = np.clip(yaw_ratio, 0.0, 1.0)
         
-        # 硬件映射 (2000=Open, 400=Close)
-        yaw_hw = int(400 + yaw_ratio * (2000 - 400))
+        # 硬件映射 (2000=Open, 0=Close)
+        yaw_hw = int(0 + yaw_ratio * (2000 - 0))
 
         # ==============================================================
         # 4. 计算 Pitch (弯曲) - 动态阈值 (保持原有逻辑)
@@ -193,6 +195,8 @@ class HandController:
             print(">>> [Hand Re-acquired] 手部重新捕获，平滑重置...")
             self.is_lost = False
             self.filter_inited = False # 标记需要重置滤波器
+            self.last_thumb_raw_yaw = None   # 重置突变检测
+            self.last_thumb_raw_pitch = None
             
         # 3. 滤波
         filtered_bends = []
@@ -212,13 +216,40 @@ class HandController:
         targets = []
         
         # [NEW LOGIC] 大拇指使用专门的解耦算法
-        thumb_yaw, thumb_pitch = self._process_thumb(landmarks)
+        # 计算出的原始值 (Raw)
+        raw_yaw, raw_pitch = self._process_thumb(landmarks)
         
+        # [防抖参数] 针对 Pitch/Yaw 的正负100抖动，设置一个“静止死区”
+        # 变化量 < 150: 认为是抖动，进行强力滤波 (90%保持 + 10%更新)
+        # 变化量 >= 150: 认为是运动，直接响应
+        STABLE_THRESH = 150
+
+        if self.last_thumb_raw_yaw is None:
+            self.last_thumb_raw_yaw = raw_yaw
+            self.last_thumb_raw_pitch = raw_pitch
+        else:
+            # 1. Yaw 轴: 动态死区 (胶水防抖)
+            diff_yaw = abs(raw_yaw - self.last_thumb_raw_yaw)
+            if diff_yaw < STABLE_THRESH:
+                # [静止区] 像胶水一样粘住，消除抖动
+                self.last_thumb_raw_yaw = 0.9 * self.last_thumb_raw_yaw + 0.1 * raw_yaw
+            else:
+                # [运动区] 快速响应
+                self.last_thumb_raw_yaw = raw_yaw
+            # 2. Pitch 轴: 动态死区 (胶水防抖)
+            diff_pitch = abs(raw_pitch - self.last_thumb_raw_pitch)
+            if diff_pitch < STABLE_THRESH:
+                # [静止区] 像胶水一样粘住，消除抖动
+                self.last_thumb_raw_pitch = 0.9 * self.last_thumb_raw_pitch + 0.1 * raw_pitch
+            else:
+                # [运动区] 快速响应
+                self.last_thumb_raw_pitch = raw_pitch
+
         # ID 1 (Pos[0]): 拇指横摇 (Yaw)
-        targets.append(thumb_yaw)
+        targets.append(int(self.last_thumb_raw_yaw))
 
         # ID 2 (Pos[1]): 拇指弯曲 (Pitch)
-        targets.append(thumb_pitch)
+        targets.append(int(self.last_thumb_raw_pitch))
         
         # ID 3 (Pos[2]): 食指 -> bends[0]
         targets.append(int(filtered_bends[0] * (POS_CLOSE_VAL - POS_OPEN_VAL) + POS_OPEN_VAL))
@@ -239,7 +270,7 @@ class HandController:
         
         if index_bent and thumb_bent:
             # 进入"强力抓取模式"
-            IDEAL_OPPOSITION_YAW = 400 
+            IDEAL_OPPOSITION_YAW = 0
             
             # 使用简单的互补滤波平滑过渡过去，而不是生硬跳变
             # targets[0] 是当前的 Yaw 值
@@ -318,6 +349,10 @@ def main():
         print(f">>> 尝试打开摄像头 ID {index}...")
         temp_cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) # Windows下推荐使用 CAP_DSHOW 增加稳定性
         if temp_cap.isOpened():
+            temp_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            temp_cap.set(cv2.CAP_PROP_FPS, 30)
             print(f">>> 成功打开摄像头 ID {index}")
             cap = temp_cap
             break
@@ -355,6 +390,7 @@ def main():
     
                 if detection_result.hand_landmarks:
                     # 识别到了手 -> 计算控制量
+                    # 解包所有的返回值
                     valid_control, hw_targets = controller.process_landmarks(detection_result.hand_landmarks[0])
                     
                     # 画图反馈

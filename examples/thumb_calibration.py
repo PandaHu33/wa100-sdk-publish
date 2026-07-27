@@ -327,6 +327,20 @@ def calibration_payload(hand: str, fit: dict, sample_counts: Dict[str, int]) -> 
             "unit": "degree",
         },
         "mapping": {"open_target": 2000, "close_target": 0, "open_deadzone": 0.04, "close_deadzone": 0.06},
+        "finger_mapping": {
+            "method": "weighted_mcp_pip_rotation_magnitude",
+            "mcp_weight": 0.35,
+            "pip_weight": 0.65,
+            "open_deadzone": 0.06,
+            "close_deadzone": 0.12,
+            "channels": {
+                "index": {"open_feature_deg": 9.75, "close_feature_deg": 58.67},
+                "middle": {"open_feature_deg": 5.11, "close_feature_deg": 57.85},
+                "ring": {"open_feature_deg": 6.50, "close_feature_deg": 58.21},
+                "pinky": {"open_feature_deg": 13.00, "close_feature_deg": 59.29},
+            },
+            "provenance": "migrated_measured_ranges; replace through endpoint calibration",
+        },
         "quality": fit["metrics"],
         "sample_counts": sample_counts,
     }

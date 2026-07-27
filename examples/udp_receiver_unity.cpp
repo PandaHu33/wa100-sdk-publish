@@ -36,6 +36,7 @@ using json = nlohmann::json;
 #define RECORDING_TELEMETRY_IP "127.0.0.1"
 #define RECORDING_TELEMETRY_PORT 25003
 #define SENSOR_ALIGNMENT_GLOVE_PORT 25005
+#define MASTER_FUSION_GLOVE_PORT 25008
 #define BUFFER_SIZE 65536
 #define MAX_UDP_DRAIN_PER_TICK 16
 
@@ -96,6 +97,18 @@ glove_thumb::Mapper g_glove_thumb_mapper;
 glove_thumb::MappingDebug g_last_thumb_mapping_debug;
 std::string g_thumb_calibration_path;
 bool g_thumb_calibration_hot_reload = false;
+
+struct FourFingerMappingCalibration {
+    double mcp_weight = 0.35;
+    double pip_weight = 0.65;
+    double open_deadzone = 0.06;
+    double close_deadzone = 0.12;
+    std::array<double, 4> open_feature = {9.75, 5.11, 6.50, 13.00};
+    std::array<double, 4> close_feature = {58.67, 57.85, 58.21, 59.29};
+    bool configured_from_json = false;
+};
+
+FourFingerMappingCalibration g_four_finger_calibration;
 
 WA100FastDriver g_fast_driver;
 
@@ -596,7 +609,38 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
         }
         glove_thumb::Mapper candidate;
         if (!candidate.Configure(calibration, &error)) return false;
+        FourFingerMappingCalibration four_finger_candidate;
+        if (root.contains("finger_mapping")) {
+            const auto& finger_mapping = root.at("finger_mapping");
+            four_finger_candidate.mcp_weight = finger_mapping.at("mcp_weight").get<double>();
+            four_finger_candidate.pip_weight = finger_mapping.at("pip_weight").get<double>();
+            four_finger_candidate.open_deadzone =
+                finger_mapping.value("open_deadzone", four_finger_candidate.open_deadzone);
+            four_finger_candidate.close_deadzone =
+                finger_mapping.value("close_deadzone", four_finger_candidate.close_deadzone);
+            const auto& channels = finger_mapping.at("channels");
+            const std::array<const char*, 4> names = {"index", "middle", "ring", "pinky"};
+            for (std::size_t index = 0; index < names.size(); ++index) {
+                four_finger_candidate.open_feature[index] =
+                    channels.at(names[index]).at("open_feature_deg").get<double>();
+                four_finger_candidate.close_feature[index] =
+                    channels.at(names[index]).at("close_feature_deg").get<double>();
+                if (four_finger_candidate.close_feature[index] -
+                        four_finger_candidate.open_feature[index] < 1e-6) {
+                    error = std::string("invalid finger feature range: ") + names[index];
+                    return false;
+                }
+            }
+            if (std::abs(
+                    four_finger_candidate.mcp_weight + four_finger_candidate.pip_weight - 1.0
+                ) > 1e-6) {
+                error = "finger_mapping MCP/PIP weights must sum to one";
+                return false;
+            }
+            four_finger_candidate.configured_from_json = true;
+        }
         g_glove_thumb_mapper = candidate;
+        g_four_finger_calibration = four_finger_candidate;
         return true;
     } catch (const std::exception& exception) {
         error = std::string("invalid calibration JSON: ") + exception.what();
@@ -743,25 +787,27 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     }
 
     // Fingers: use weighted MCP/PIP rotation magnitude
-    double idx_feature = 0.35 * rot_mag(index_mcp_r) + 0.65 * rot_mag(index_pip_r);
-    double mid_feature = 0.35 * rot_mag(middle_mcp_r) + 0.65 * rot_mag(middle_pip_r);
-    double ring_feature = 0.35 * rot_mag(ring_mcp_r) + 0.65 * rot_mag(ring_pip_r);
-    double pinky_feature = 0.35 * rot_mag(pinky_mcp_r) + 0.65 * rot_mag(pinky_pip_r);
-
-    // Fixed calibration ranges from your measured data.
-    // min: fully straight, max: fully bent
-    const double IDX_MIN = 9.75, IDX_MAX = 58.67;
-    const double MID_MIN = 5.11, MID_MAX = 57.85;
-    const double RING_MIN = 6.50, RING_MAX = 58.21;
-    const double PINKY_MIN = 13.00, PINKY_MAX = 59.29;
+    const auto& finger_calibration = g_four_finger_calibration;
+    double idx_feature =
+        finger_calibration.mcp_weight * rot_mag(index_mcp_r)
+        + finger_calibration.pip_weight * rot_mag(index_pip_r);
+    double mid_feature =
+        finger_calibration.mcp_weight * rot_mag(middle_mcp_r)
+        + finger_calibration.pip_weight * rot_mag(middle_pip_r);
+    double ring_feature =
+        finger_calibration.mcp_weight * rot_mag(ring_mcp_r)
+        + finger_calibration.pip_weight * rot_mag(ring_pip_r);
+    double pinky_feature =
+        finger_calibration.mcp_weight * rot_mag(pinky_mcp_r)
+        + finger_calibration.pip_weight * rot_mag(pinky_pip_r);
 
 
     // Safety: avoid commanding full 0 close to reduce overcurrent risk.
     const int SAFE_OPEN = 2000;
     const int SAFE_CLOSE = 0;
     // Dead zones near min/max: close to straight stays fully open, close to bent stays fully closed.
-    const double OPEN_DEADZONE = 0.06;   // normalized ratio [0,1]
-    const double CLOSE_DEADZONE = 0.12;  // normalized ratio [0,1]
+    const double OPEN_DEADZONE = finger_calibration.open_deadzone;
+    const double CLOSE_DEADZONE = finger_calibration.close_deadzone;
 
     auto fixed_calib_to_target = [&](double f, double fmin, double fmax) -> uint16_t {
         double span = fmax - fmin;
@@ -786,10 +832,14 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         return Clamp((int)std::lround(target), SAFE_CLOSE, SAFE_OPEN);
     };
 
-    out_targets[2] = fixed_calib_to_target(idx_feature, IDX_MIN, IDX_MAX);
-    out_targets[3] = fixed_calib_to_target(mid_feature, MID_MIN, MID_MAX);
-    out_targets[4] = fixed_calib_to_target(ring_feature, RING_MIN, RING_MAX);
-    out_targets[5] = fixed_calib_to_target(pinky_feature, PINKY_MIN, PINKY_MAX);
+    out_targets[2] = fixed_calib_to_target(
+        idx_feature, finger_calibration.open_feature[0], finger_calibration.close_feature[0]);
+    out_targets[3] = fixed_calib_to_target(
+        mid_feature, finger_calibration.open_feature[1], finger_calibration.close_feature[1]);
+    out_targets[4] = fixed_calib_to_target(
+        ring_feature, finger_calibration.open_feature[2], finger_calibration.close_feature[2]);
+    out_targets[5] = fixed_calib_to_target(
+        pinky_feature, finger_calibration.open_feature[3], finger_calibration.close_feature[3]);
 
     // Additional safety: per-packet slew-rate limit for index->pinky.
     static uint16_t last_finger_targets[4] = {2000, 2000, 2000, 2000};
@@ -1300,6 +1350,11 @@ int main(int argc, char* argv[]) {
     alignment_glove_address.sin_family = AF_INET;
     alignment_glove_address.sin_port = htons(SENSOR_ALIGNMENT_GLOVE_PORT);
     alignment_glove_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
+    SOCKET fusion_glove_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in fusion_glove_address{};
+    fusion_glove_address.sin_family = AF_INET;
+    fusion_glove_address.sin_port = htons(MASTER_FUSION_GLOVE_PORT);
+    fusion_glove_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
     auto next_thumb_calibration_reload = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     std::string last_thumb_reload_error;
     if (IsUnityInputLoggingEnabled()) {
@@ -1362,28 +1417,58 @@ int main(int argc, char* argv[]) {
                 if (accepted) {
                     memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
                     got_valid = true;
-                    if (alignment_glove_socket != INVALID_SOCKET) {
-                        // Read-only mirror for controller/glove time-space calibration.
-                        // Add the PC receive clock so it is directly comparable with
-                        // Hand_Tracker's controller receive clock.
+                    if (alignment_glove_socket != INVALID_SOCKET || fusion_glove_socket != INVALID_SOCKET) {
+                        // Versioned read-only Hi5 frame. Port 25005 remains dedicated
+                        // to the calibration tool; port 25008 feeds runtime fusion so
+                        // the two consumers never compete for one UDP datagram.
                         try {
                             json alignment_packet = json::parse(std::string(packet, packet + packet_len));
                             const char* rotation_key = g_unity_hand_side == UnityHandSide::Left
                                 ? "leftRotations" : "rightRotations";
                             if (alignment_packet.contains(rotation_key)) {
                                 alignment_packet["type"] = "glove_sensor_frame";
-                                alignment_packet["schema_version"] = 1;
+                                alignment_packet["schema_version"] = 2;
                                 alignment_packet["receiver_wall_time_ns"] = GetCurrentTimeNs();
+                                alignment_packet["publish_wall_time_ns"] = GetCurrentTimeNs();
+                                alignment_packet["valid"] = true;
+                                alignment_packet["hand_side"] = HandSideToString(g_unity_hand_side);
+                                alignment_packet["bone_count"] = 21;
+                                alignment_packet["bone_layout"] = {
+                                    {"0", "ForeArm"},
+                                    {"1", "Hand"},
+                                    {"2-20", "local_finger_bones"},
+                                };
+                                alignment_packet["forearm_index"] = 0;
+                                alignment_packet["hand_index"] = 1;
+                                alignment_packet["local_finger_start_index"] = 2;
+                                alignment_packet["mapped_target_units"] =
+                                    std::vector<uint16_t>(temp_pos, temp_pos + 6);
+                                alignment_packet["control_mode"] =
+                                    ControlModeToString((ControlMode)g_control_mode.load());
+                                alignment_packet["glove_calibration_id"] =
+                                    g_glove_thumb_mapper.configured()
+                                    ? g_glove_thumb_mapper.calibration().calibration_id
+                                    : std::string();
+                                alignment_packet["thumb_mapping_valid"] =
+                                    g_last_thumb_mapping_debug.valid;
                                 const std::string encoded_alignment = alignment_packet.dump();
-                                sendto(
-                                    alignment_glove_socket, encoded_alignment.data(),
-                                    static_cast<int>(encoded_alignment.size()), 0,
-                                    reinterpret_cast<const sockaddr*>(&alignment_glove_address),
-                                    sizeof(alignment_glove_address));
+                                if (alignment_glove_socket != INVALID_SOCKET) {
+                                    sendto(
+                                        alignment_glove_socket, encoded_alignment.data(),
+                                        static_cast<int>(encoded_alignment.size()), 0,
+                                        reinterpret_cast<const sockaddr*>(&alignment_glove_address),
+                                        sizeof(alignment_glove_address));
+                                }
+                                if (fusion_glove_socket != INVALID_SOCKET) {
+                                    sendto(
+                                        fusion_glove_socket, encoded_alignment.data(),
+                                        static_cast<int>(encoded_alignment.size()), 0,
+                                        reinterpret_cast<const sockaddr*>(&fusion_glove_address),
+                                        sizeof(fusion_glove_address));
+                                }
                             }
                         } catch (...) {
-                            // The normal control path already accepted this packet;
-                            // alignment telemetry must never affect control.
+                            // Read-only telemetry must never affect normal control.
                         }
                     }
                 }
@@ -1429,6 +1514,7 @@ int main(int argc, char* argv[]) {
 
     closesocket(server_fd);
     if (alignment_glove_socket != INVALID_SOCKET) closesocket(alignment_glove_socket);
+    if (fusion_glove_socket != INVALID_SOCKET) closesocket(fusion_glove_socket);
     WSACleanup();
     return 0;
 }

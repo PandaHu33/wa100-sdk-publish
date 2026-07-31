@@ -245,11 +245,11 @@ class HandController:
                 # [运动区] 快速响应
                 self.last_thumb_raw_pitch = raw_pitch
 
-        # ID 1 (Pos[0]): 拇指横摇 (Yaw)
-        targets.append(int(self.last_thumb_raw_yaw))
-
-        # ID 2 (Pos[1]): 拇指弯曲 (Pitch)
+        # ID 1 (Pos[0]): 拇指弯曲 (Pitch)
         targets.append(int(self.last_thumb_raw_pitch))
+
+        # ID 2 (Pos[1]): 拇指横摇/对掌 (Yaw)
+        targets.append(int(self.last_thumb_raw_yaw))
         
         # ID 3 (Pos[2]): 食指 -> bends[0]
         targets.append(int(filtered_bends[0] * (POS_CLOSE_VAL - POS_OPEN_VAL) + POS_OPEN_VAL))
@@ -266,15 +266,15 @@ class HandController:
         # === 5. 包络抓取增强 (Grasp Assist) ===
         
         index_bent = targets[2] < 1000  # 食指弯了一半以上 (2000=Open, 0=Close)
-        thumb_bent = targets[1] < 1000  # 拇指弯了一半以上
+        thumb_bent = targets[0] < 1000  # ID1：拇指弯了一半以上
         
         if index_bent and thumb_bent:
             # 进入"强力抓取模式"
             IDEAL_OPPOSITION_YAW = 0
             
             # 使用简单的互补滤波平滑过渡过去，而不是生硬跳变
-            # targets[0] 是当前的 Yaw 值
-            targets[0] = int(0.7 * targets[0] + 0.3 * IDEAL_OPPOSITION_YAW)
+            # targets[1] 是硬件 ID2 的当前 Yaw 值
+            targets[1] = int(0.7 * targets[1] + 0.3 * IDEAL_OPPOSITION_YAW)
         
         # 6. [核心安全机制] 变化率限制 (Slew Rate Limiting)
         safe_targets = []

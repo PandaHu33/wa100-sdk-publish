@@ -17,10 +17,8 @@ DISPLAY_SOURCE_MAP = {
     # Display-layer remap only for command-side curves.
 }
 REAL_SOURCE_MAP = {
-    # The thumb real-position feedback appears cross-wired in the plots:
-    # ID1 command aligns with ID2 real, and ID2 command aligns with ID1 real.
-    "ID1": "ID2",
-    "ID2": "ID1",
+    # Commands and feedback now both use physical hardware order:
+    # ID1 thumb pitch, ID2 thumb yaw.
 }
 DEFAULT_LOG_CANDIDATES = [
     Path("build/bin/admittance_log.csv"),

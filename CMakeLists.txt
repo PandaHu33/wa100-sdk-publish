@@ -169,6 +169,12 @@ add_executable(wa100_feedback_filter_test
 target_include_directories(wa100_feedback_filter_test PRIVATE ${EXAMPLES_DIR})
 add_test(NAME wa100_feedback_filter_test COMMAND wa100_feedback_filter_test)
 
+add_executable(wa100_channel_layout_test
+    ${SDK_ROOT_DIR}/tests/wa100_channel_layout_test.cpp
+)
+target_include_directories(wa100_channel_layout_test PRIVATE ${EXAMPLES_DIR})
+add_test(NAME wa100_channel_layout_test COMMAND wa100_channel_layout_test)
+
 # ========== 安装规则 ==========
 install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver udp_receiver_unity
     RUNTIME DESTINATION bin

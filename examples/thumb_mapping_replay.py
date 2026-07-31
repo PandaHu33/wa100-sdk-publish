@@ -189,10 +189,10 @@ def main() -> int:
                     "replay_middle": replayed_fingers[1],
                     "replay_ring": replayed_fingers[2],
                     "replay_pinky": replayed_fingers[3],
-                    "actual_yaw": actual_row.get(1, {}).get("REAL", ""),
-                    "actual_pitch": actual_row.get(2, {}).get("REAL", ""),
-                    "command_yaw": actual_row.get(1, {}).get("CMD", ""),
-                    "command_pitch": actual_row.get(2, {}).get("CMD", ""),
+                    "actual_yaw": actual_row.get(2, {}).get("REAL", ""),
+                    "actual_pitch": actual_row.get(1, {}).get("REAL", ""),
+                    "command_yaw": actual_row.get(2, {}).get("CMD", ""),
+                    "command_pitch": actual_row.get(1, {}).get("CMD", ""),
                 }
             )
             if args.max_frames and len(rows) >= args.max_frames:

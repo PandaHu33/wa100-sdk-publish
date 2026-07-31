@@ -8,6 +8,7 @@
 #include "wa100_fast_driver.h"
 #include "json.hpp"
 #include "glove_thumb_mapper.h"
+#include "wa100_channel_layout.h"
 #include "wa100_feedback_filter.h"
 
 #include <algorithm>
@@ -376,8 +377,11 @@ static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
         VR_HAND_CALIBRATION.thumb_pitch_open,
         VR_HAND_CALIBRATION.thumb_pitch_close);
 
-    out_targets[0] = RatioToTarget(thumb_yaw_ratio, VR_HAND_CALIBRATION.thumb_yaw_sensitivity);
-    out_targets[1] = RatioToTarget(thumb_pitch_ratio, VR_HAND_CALIBRATION.thumb_pitch_sensitivity);
+    const uint16_t thumb_yaw_target =
+        RatioToTarget(thumb_yaw_ratio, VR_HAND_CALIBRATION.thumb_yaw_sensitivity);
+    const uint16_t thumb_pitch_target =
+        RatioToTarget(thumb_pitch_ratio, VR_HAND_CALIBRATION.thumb_pitch_sensitivity);
+    wa100_channel_layout::SetThumbTargets(thumb_pitch_target, thumb_yaw_target, out_targets);
     out_targets[2] = RatioToTarget(FingerCurlRatio(hand_pos, 5, 6, 8, VR_HAND_CALIBRATION.index_open, VR_HAND_CALIBRATION.index_close));
     out_targets[3] = RatioToTarget(FingerCurlRatio(hand_pos, 9, 10, 12, VR_HAND_CALIBRATION.middle_open, VR_HAND_CALIBRATION.middle_close));
     out_targets[4] = RatioToTarget(FingerCurlRatio(hand_pos, 13, 14, 16, VR_HAND_CALIBRATION.ring_open, VR_HAND_CALIBRATION.ring_close));
@@ -716,7 +720,8 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
     return false;
 }
 
-// Map Unity hand joints to WA100 targets [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
+// Map Unity hand joints to physical WA100 order:
+// [ID1 thumb_pitch, ID2 thumb_yaw, ID3 index, ID4 middle, ID5 ring, ID6 pinky].
 static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     const char* rot_key = g_unity_hand_side == UnityHandSide::Left ? "leftRotations" : "rightRotations";
 
@@ -760,7 +765,9 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     }
     g_last_thumb_mapping_debug = g_glove_thumb_mapper.Map(rotations);
     // Missing or invalid calibration fails safe for the two thumb motors only.
-    out_targets[0] = g_last_thumb_mapping_debug.valid ? g_last_thumb_mapping_debug.yaw_target : 2000;
+    const uint16_t thumb_yaw_target =
+        g_last_thumb_mapping_debug.valid ? g_last_thumb_mapping_debug.yaw_target : 2000;
+    uint16_t thumb_pitch_target = 2000;
     if (g_last_thumb_mapping_debug.valid) {
         // The glove has only one physical thumb sensor. Keep calibrated quaternion
         // projection for yaw, but calculate flexion like index-to-pinky from the
@@ -775,16 +782,14 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
             calibration.pitch_close_score,
             calibration.open_deadzone,
             calibration.close_deadzone);
-        const uint16_t thumb_pitch_target = glove_thumb::Mapper::RatioToTarget(
+        thumb_pitch_target = glove_thumb::Mapper::RatioToTarget(
             thumb_pitch_ratio, calibration.open_target, calibration.close_target);
         g_last_thumb_mapping_debug.pitch_projected = thumb_pitch_feature;
         g_last_thumb_mapping_debug.pitch_score = thumb_pitch_feature;
         g_last_thumb_mapping_debug.pitch_ratio = thumb_pitch_ratio;
         g_last_thumb_mapping_debug.pitch_target = thumb_pitch_target;
-        out_targets[1] = thumb_pitch_target;
-    } else {
-        out_targets[1] = 2000;
     }
+    wa100_channel_layout::SetThumbTargets(thumb_pitch_target, thumb_yaw_target, out_targets);
 
     // Fingers: use weighted MCP/PIP rotation magnitude
     const auto& finger_calibration = g_four_finger_calibration;
@@ -864,6 +869,7 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
 
         bool handled_control = false;
         if (ParseH5ControlPacket(j, out_targets, handled_control)) {
+            wa100_channel_layout::ApplyFourFingerClosingCompensation(out_targets);
             return true;
         }
         if (handled_control) {
@@ -873,13 +879,16 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
         const bool is_vr_packet = JsonStringEquals(j, "source", "xr-hands") ||
                                   JsonStringContains(j, "jointFormat", "unity-xr-hands");
         const ControlMode active_mode = (ControlMode)g_control_mode.load();
+        bool accepted = false;
         if (active_mode == ControlMode::Vr) {
-            return is_vr_packet ? MapVrHandTrackingToTargets(j, out_targets) : false;
+            accepted = is_vr_packet && MapVrHandTrackingToTargets(j, out_targets);
+        } else if (active_mode == ControlMode::Glove) {
+            accepted = !is_vr_packet && MapUnityToTargets(j, out_targets);
         }
-        if (active_mode == ControlMode::Glove) {
-            return is_vr_packet ? false : MapUnityToTargets(j, out_targets);
+        if (accepted) {
+            wa100_channel_layout::ApplyFourFingerClosingCompensation(out_targets);
         }
-        return false;
+        return accepted;
     } catch (...) {
         return false;
     }
@@ -1092,7 +1101,10 @@ void ComplianceControlLoop() {
         if (telemetry_now >= next_telemetry_time && telemetry_socket != INVALID_SOCKET) {
             json telemetry;
             telemetry["type"] = "wa100_recording_state";
-            telemetry["schema_version"] = 2;
+            telemetry["schema_version"] = 3;
+            telemetry["channel_names"] = {
+                "thumb_pitch", "thumb_yaw", "index", "middle", "ring", "pinky",
+            };
             telemetry["seq"] = telemetry_sequence++;
             telemetry["source_time_ns"] = GetCurrentTimeNs();
             telemetry["source_monotonic_ns"] = GetSteadyTimeNs();
@@ -1276,7 +1288,15 @@ int main(int argc, char* argv[]) {
     std::cout << ">>> Unity JSON source: "
               << HandSideToString(g_unity_hand_side)
               << "Rotations (glove mode does not use Positions)" << std::endl;
-    std::cout << ">>> H5 control: JSON {type:h5_hand_control, mode:vr|glove|preset, positions:[6]} on same UDP port" << std::endl;
+    std::cout << ">>> H5 control positions use hardware order: "
+              << "[ID1 thumb_pitch, ID2 thumb_yaw, ID3 index, ID4 middle, ID5 ring, ID6 pinky]"
+              << std::endl;
+    std::cout << ">>> Four-finger closing dead-zone compensation: "
+              << "[ID3=" << wa100_channel_layout::kFingerCloseEngageTargets[0]
+              << ", ID4=" << wa100_channel_layout::kFingerCloseEngageTargets[1]
+              << ", ID5=" << wa100_channel_layout::kFingerCloseEngageTargets[2]
+              << ", ID6=" << wa100_channel_layout::kFingerCloseEngageTargets[3]
+              << "] (fully open remains 2000)" << std::endl;
     std::cout << ">>> initial hand control mode: "
               << ControlModeToString((ControlMode)g_control_mode.load()) << std::endl;
     std::cout << ">>> tendon-driven mode: one-way admittance only, soft current band "
@@ -1427,7 +1447,7 @@ int main(int argc, char* argv[]) {
                                 ? "leftRotations" : "rightRotations";
                             if (alignment_packet.contains(rotation_key)) {
                                 alignment_packet["type"] = "glove_sensor_frame";
-                                alignment_packet["schema_version"] = 2;
+                                alignment_packet["schema_version"] = 3;
                                 alignment_packet["receiver_wall_time_ns"] = GetCurrentTimeNs();
                                 alignment_packet["publish_wall_time_ns"] = GetCurrentTimeNs();
                                 alignment_packet["valid"] = true;
@@ -1443,6 +1463,9 @@ int main(int argc, char* argv[]) {
                                 alignment_packet["local_finger_start_index"] = 2;
                                 alignment_packet["mapped_target_units"] =
                                     std::vector<uint16_t>(temp_pos, temp_pos + 6);
+                                alignment_packet["mapped_target_channel_names"] = {
+                                    "thumb_pitch", "thumb_yaw", "index", "middle", "ring", "pinky",
+                                };
                                 alignment_packet["control_mode"] =
                                     ControlModeToString((ControlMode)g_control_mode.load());
                                 alignment_packet["glove_calibration_id"] =

@@ -38,6 +38,7 @@ using json = nlohmann::json;
 #define RECORDING_TELEMETRY_PORT 25003
 #define SENSOR_ALIGNMENT_GLOVE_PORT 25005
 #define MASTER_FUSION_GLOVE_PORT 25008
+#define RAW_MASTER_TELEMETRY_PORT 25009
 #define BUFFER_SIZE 65536
 #define MAX_UDP_DRAIN_PER_TICK 16
 
@@ -860,6 +861,11 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     return true;
 }
 
+static bool IsVrHandPacket(const json& j) {
+    return JsonStringEquals(j, "source", "xr-hands") ||
+           JsonStringContains(j, "jointFormat", "unity-xr-hands");
+}
+
 static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[6]) {
     if (data == nullptr || len <= 0) return false;
 
@@ -876,8 +882,7 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
             return false;
         }
 
-        const bool is_vr_packet = JsonStringEquals(j, "source", "xr-hands") ||
-                                  JsonStringContains(j, "jointFormat", "unity-xr-hands");
+        const bool is_vr_packet = IsVrHandPacket(j);
         const ControlMode active_mode = (ControlMode)g_control_mode.load();
         bool accepted = false;
         if (active_mode == ControlMode::Vr) {
@@ -1375,6 +1380,11 @@ int main(int argc, char* argv[]) {
     fusion_glove_address.sin_family = AF_INET;
     fusion_glove_address.sin_port = htons(MASTER_FUSION_GLOVE_PORT);
     fusion_glove_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
+    SOCKET raw_master_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in raw_master_address{};
+    raw_master_address.sin_family = AF_INET;
+    raw_master_address.sin_port = htons(RAW_MASTER_TELEMETRY_PORT);
+    raw_master_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
     auto next_thumb_calibration_reload = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     std::string last_thumb_reload_error;
     if (IsUnityInputLoggingEnabled()) {
@@ -1433,6 +1443,36 @@ int main(int argc, char* argv[]) {
                     }
                     unity_input_log << record.dump() << '\n';
                     unity_input_log.flush();
+                }
+                if (accepted && raw_master_socket != INVALID_SOCKET) {
+                    try {
+                        json native_payload = json::parse(std::string(packet, packet + packet_len));
+                        const ControlMode active_mode = (ControlMode)g_control_mode.load();
+                        const bool is_vr_packet = IsVrHandPacket(native_payload);
+                        std::string source;
+                        if (active_mode == ControlMode::Vr && is_vr_packet) {
+                            source = "pico_hand";
+                        } else if (active_mode == ControlMode::Glove && !is_vr_packet) {
+                            source = "data_glove";
+                        }
+                        if (!source.empty()) {
+                            native_payload["stream"] = "hand_skeleton";
+                            native_payload["source_timestamp_ns"] = GetCurrentTimeNs();
+                            json envelope = {
+                                {"type", "raw_master_input"},
+                                {"schema_version", 1},
+                                {"source", source},
+                                {"signal_form", "continuous"},
+                                {"value", native_payload},
+                            };
+                            const std::string encoded_raw = envelope.dump();
+                            sendto(
+                                raw_master_socket, encoded_raw.data(), static_cast<int>(encoded_raw.size()), 0,
+                                reinterpret_cast<const sockaddr*>(&raw_master_address), sizeof(raw_master_address));
+                        }
+                    } catch (...) {
+                        // Raw recording telemetry must never affect hand control.
+                    }
                 }
                 if (accepted) {
                     memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
@@ -1538,6 +1578,7 @@ int main(int argc, char* argv[]) {
     closesocket(server_fd);
     if (alignment_glove_socket != INVALID_SOCKET) closesocket(alignment_glove_socket);
     if (fusion_glove_socket != INVALID_SOCKET) closesocket(fusion_glove_socket);
+    if (raw_master_socket != INVALID_SOCKET) closesocket(raw_master_socket);
     WSACleanup();
     return 0;
 }

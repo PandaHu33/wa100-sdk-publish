@@ -88,6 +88,35 @@ void TestYawAndPitchAreIndependent() {
     Require(pitch_result.yaw_target == 2000, "pitch must not move yaw");
 }
 
+void TestWristProjectionIsRemovedFromBothAxes() {
+    Calibration calibration = BaseCalibration();
+    calibration.yaw_axis.fill(0.0);
+    calibration.pitch_axis.fill(0.0);
+    calibration.yaw_axis[1] = 1.0;   // wrist Y
+    calibration.yaw_axis[4] = 1.0;   // thumb CMC Y
+    calibration.pitch_axis[2] = 1.0; // wrist Z
+    calibration.pitch_axis[8] = 1.0; // thumb MCP Z
+    calibration.wrist_compensation_enabled = true;
+    calibration.wrist_joint_index = 1;
+
+    Mapper mapper;
+    std::string error;
+    Require(mapper.Configure(calibration, &error), "wrist compensation calibration: " + error);
+
+    auto wrist_only = NeutralRotations();
+    wrist_only[1] = {0.0, 30.0, 30.0};
+    const auto wrist_result = mapper.Map(wrist_only);
+    Require(wrist_result.yaw_target == 2000 && wrist_result.pitch_target == 2000,
+            "wrist-only rotation must not drive either thumb channel");
+
+    auto thumb_only = NeutralRotations();
+    thumb_only[2].y = 30.0;
+    thumb_only[3].z = 30.0;
+    const auto thumb_result = mapper.Map(thumb_only);
+    Require(thumb_result.yaw_score > 20.0 && thumb_result.pitch_score > 20.0,
+            "thumb rotation must remain after wrist projection removal");
+}
+
 void TestInvalidCalibrationFailsSafe() {
     Calibration calibration = BaseCalibration();
     calibration.hand = "unknown";
@@ -136,6 +165,7 @@ int main() {
     TestEulerWrapIsContinuous();
     TestNeutralPoseIsOpen();
     TestYawAndPitchAreIndependent();
+    TestWristProjectionIsRemovedFromBothAxes();
     TestInvalidCalibrationFailsSafe();
     TestManualOutputTargetsAreApplied();
     TestFingerStyleScalarPitchMapping();

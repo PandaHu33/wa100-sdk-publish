@@ -77,9 +77,10 @@ enum class UnityHandSide {
 };
 
 enum class ControlMode {
-    Glove = 0,
-    Vr = 1,
-    Preset = 2,
+    Idle = 0,
+    Glove = 1,
+    Vr = 2,
+    Preset = 3,
 };
 
 struct SerialSettings {
@@ -92,7 +93,8 @@ std::mutex g_mutex;
 uint16_t g_udp_target_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 uint16_t g_preset_target_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 std::atomic<long long> g_last_udp_pkt_time = 0;
-std::atomic<int> g_control_mode((int)ControlMode::Glove);
+std::atomic<int> g_control_mode((int)ControlMode::Idle);
+uint16_t g_latest_actual_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 bool g_running = true;
 UnityHandSide g_unity_hand_side = UnityHandSide::Right;
 glove_thumb::Mapper g_glove_thumb_mapper;
@@ -111,6 +113,32 @@ struct FourFingerMappingCalibration {
 };
 
 FourFingerMappingCalibration g_four_finger_calibration;
+
+struct GestureAnchor {
+    bool enabled = false;
+    std::array<double, 9> tip_positions{};
+    double radius = 0.0;
+    std::array<int, 6> targets{{-1, -1, -1, -1, -1, -1}};
+};
+
+struct ThumbPositionFusionCalibration {
+    bool enabled = false;
+    double support_radius = 1.0;
+    double influence = 0.0;
+};
+
+struct ThumbPositionFusionDebug {
+    bool valid = false;
+    double segment_ratio = 0.0;
+    double distance_to_segment = 0.0;
+    double weight = 0.0;
+    uint16_t pitch_target = 2000;
+    uint16_t yaw_target = 2000;
+};
+
+std::array<GestureAnchor, 2> g_gesture_anchors{};
+ThumbPositionFusionCalibration g_thumb_position_fusion;
+ThumbPositionFusionDebug g_last_thumb_position_fusion_debug;
 
 WA100FastDriver g_fast_driver;
 
@@ -235,6 +263,7 @@ static const char* HandSideToString(UnityHandSide side) {
 }
 
 static const char* ControlModeToString(ControlMode mode) {
+    if (mode == ControlMode::Idle) return "idle";
     if (mode == ControlMode::Vr) return "vr";
     if (mode == ControlMode::Preset) return "preset";
     return "glove";
@@ -510,6 +539,12 @@ static json ThumbMappingDebugToJson(const glove_thumb::MappingDebug& debug) {
         {"residual_norm", debug.residual_norm},
         {"yaw_projected", debug.yaw_projected},
         {"pitch_projected", debug.pitch_projected},
+        {"wrist_compensation_enabled", debug.wrist_compensation_enabled},
+        {"wrist_rotation_deg", debug.wrist_rotation_deg},
+        {"wrist_wrap_adjusted", debug.wrist_wrap_adjusted},
+        {"yaw_score_uncompensated", debug.yaw_score_uncompensated},
+        {"yaw_wrist_component", debug.yaw_wrist_component},
+        {"pitch_wrist_component", debug.pitch_wrist_direct_component + debug.pitch_wrist_pose_component},
         {"yaw_score", debug.yaw_score},
         {"pitch_score", debug.pitch_score},
         {"yaw_ratio", debug.yaw_ratio},
@@ -525,6 +560,25 @@ static bool ReadFixedVector(
     std::string& error,
     const char* name) {
     if (!value.is_array() || value.size() != glove_thumb::kFeatureDimension) {
+        error = std::string(name) + " must contain 9 numbers";
+        return false;
+    }
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        if (!value[index].is_number()) {
+            error = std::string(name) + " contains a non-number";
+            return false;
+        }
+        output[index] = value[index].get<double>();
+    }
+    return true;
+}
+
+static bool ReadNineValues(
+    const json& value,
+    std::array<double, 9>& output,
+    std::string& error,
+    const char* name) {
+    if (!value.is_array() || value.size() != output.size()) {
         error = std::string(name) + " must contain 9 numbers";
         return false;
     }
@@ -608,6 +662,38 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
             calibration.open_target = root["mapping"].value("open_target", calibration.open_target);
             calibration.close_target = root["mapping"].value("close_target", calibration.close_target);
         }
+        if (root.contains("wrist_compensation")) {
+            const auto& wrist = root.at("wrist_compensation");
+            calibration.wrist_compensation_enabled = wrist.value("enabled", false);
+            calibration.wrist_joint_index = wrist.value("joint_index", 1);
+            calibration.wrist_influence_coefficient = wrist.value("influence_coefficient", 1.0);
+            auto read_wrist_terms = [&](const char* key, auto& destination) {
+                if (!wrist.contains(key)) return true;
+                const auto& terms = wrist.at(key);
+                if (!terms.is_array() || terms.size() != destination.size()) {
+                    error = std::string("wrist ") + key + " must contain 9 values";
+                    return false;
+                }
+                for (std::size_t index = 0; index < destination.size(); ++index) {
+                    destination[index] = terms[index].get<double>();
+                }
+                return true;
+            };
+            if (!read_wrist_terms("pose_influence_terms", calibration.wrist_influence_terms) ||
+                !read_wrist_terms("pitch_pose_influence_terms", calibration.wrist_pitch_influence_terms)) {
+                return false;
+            }
+            if (wrist.contains("pose_reference_xyz")) {
+                const auto& reference = wrist.at("pose_reference_xyz");
+                if (!reference.is_array() || reference.size() != 3) {
+                    error = "wrist pose_reference_xyz must contain 3 values";
+                    return false;
+                }
+                for (std::size_t index = 0; index < 3; ++index) {
+                    calibration.wrist_pose_reference[index] = reference[index].get<double>();
+                }
+            }
+        }
         if (calibration.hand != HandSideToString(g_unity_hand_side)) {
             error = "calibration hand does not match selected Unity hand";
             return false;
@@ -644,8 +730,66 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
             }
             four_finger_candidate.configured_from_json = true;
         }
+        std::array<GestureAnchor, 2> gesture_candidates{};
+        if (root.contains("gesture_anchors")) {
+            const auto& anchors = root.at("gesture_anchors");
+            const std::array<const char*, 2> names = {
+                "thumb_index_touch", "thumb_middle_touch",
+            };
+            for (std::size_t anchor_index = 0; anchor_index < names.size(); ++anchor_index) {
+                if (!anchors.contains(names[anchor_index])) continue;
+                const auto& source = anchors.at(names[anchor_index]);
+                auto& destination = gesture_candidates[anchor_index];
+                destination.enabled = source.value("enabled", true);
+                destination.radius = source.at("activation_radius").get<double>();
+                if (!std::isfinite(destination.radius) || destination.radius <= 0.0) {
+                    error = std::string(names[anchor_index]) + " activation_radius must be positive";
+                    return false;
+                }
+                if (!ReadNineValues(
+                        source.at("tip_positions_hand_local"), destination.tip_positions,
+                        error, names[anchor_index])) {
+                    return false;
+                }
+                if (source.contains("targets")) {
+                    const auto& targets = source.at("targets");
+                    for (std::size_t channel = 0; channel < destination.targets.size(); ++channel) {
+                        const std::string id = std::to_string(channel + 1);
+                        if (!targets.contains(id)) continue;
+                        const int value = targets.at(id).get<int>();
+                        if (value < 0 || value > 2000) {
+                            error = std::string(names[anchor_index]) + " target must be in 0..2000";
+                            return false;
+                        }
+                        destination.targets[channel] = value;
+                    }
+                }
+            }
+        }
+        ThumbPositionFusionCalibration position_fusion_candidate;
+        if (root.contains("thumb_position_fusion")) {
+            const auto& fusion = root.at("thumb_position_fusion");
+            position_fusion_candidate.enabled = fusion.value("enabled", true);
+            position_fusion_candidate.support_radius =
+                fusion.value("support_radius", position_fusion_candidate.support_radius);
+            position_fusion_candidate.influence =
+                fusion.value("influence", position_fusion_candidate.influence);
+            if (!std::isfinite(position_fusion_candidate.support_radius) ||
+                position_fusion_candidate.support_radius <= 0.0) {
+                error = "thumb_position_fusion support_radius must be positive";
+                return false;
+            }
+            if (!std::isfinite(position_fusion_candidate.influence) ||
+                position_fusion_candidate.influence < 0.0 ||
+                position_fusion_candidate.influence > 1.0) {
+                error = "thumb_position_fusion influence must be in 0..1";
+                return false;
+            }
+        }
         g_glove_thumb_mapper = candidate;
         g_four_finger_calibration = four_finger_candidate;
+        g_gesture_anchors = gesture_candidates;
+        g_thumb_position_fusion = position_fusion_candidate;
         return true;
     } catch (const std::exception& exception) {
         error = std::string("invalid calibration JSON: ") + exception.what();
@@ -678,6 +822,19 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
     handled = true;
     std::string mode = j.value("mode", "glove");
     std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+    if (mode == "idle" || mode == "none") {
+        g_control_mode.store((int)ControlMode::Idle);
+        const uint16_t safe_open_targets[6] = {2000, 2000, 2000, 2000, 2000, 2000};
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            memcpy(out_targets, safe_open_targets, sizeof(safe_open_targets));
+            memcpy(g_udp_target_pos, safe_open_targets, sizeof(safe_open_targets));
+            memcpy(g_preset_target_pos, safe_open_targets, sizeof(safe_open_targets));
+        }
+        std::cout << ">>> [H5] control mode -> idle (forcing all encoders to 2000)" << std::endl;
+        return false;
+    }
 
     if (mode == "glove") {
         g_control_mode.store((int)ControlMode::Glove);
@@ -721,10 +878,168 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
     return false;
 }
 
+static Vec3 AddVector(const Vec3& left, const Vec3& right) {
+    return {left.x + right.x, left.y + right.y, left.z + right.z};
+}
+
+static glove_thumb::Quaternion MultiplyQuaternion(
+    const glove_thumb::Quaternion& left,
+    const glove_thumb::Quaternion& right) {
+    return {
+        left.w * right.w - left.x * right.x - left.y * right.y - left.z * right.z,
+        left.w * right.x + left.x * right.w + left.y * right.z - left.z * right.y,
+        left.w * right.y - left.x * right.z + left.y * right.w + left.z * right.x,
+        left.w * right.z + left.x * right.y - left.y * right.x + left.z * right.w,
+    };
+}
+
+static Vec3 RotateVector(const glove_thumb::Quaternion& q, const Vec3& value) {
+    const glove_thumb::Quaternion vector{0.0, value.x, value.y, value.z};
+    const glove_thumb::Quaternion conjugate{q.w, -q.x, -q.y, -q.z};
+    const auto rotated = MultiplyQuaternion(MultiplyQuaternion(q, vector), conjugate);
+    return {rotated.x, rotated.y, rotated.z};
+}
+
+static bool BuildHandLocalTipFeature(
+    const std::vector<double>& hand_positions,
+    const std::vector<glove_thumb::EulerDeg>& rotations,
+    const std::string& euler_order,
+    std::array<double, 9>& feature) {
+    if (hand_positions.size() < 63 || rotations.size() < 21) return false;
+    static const int parents[21] = {
+        -1, 0, 1, 2, 3, 1, 5, 6, 7, 1, 9, 10, 11, 1, 13, 14, 15, 1, 17, 18, 19,
+    };
+    std::array<Vec3, 21> positions{};
+    std::array<glove_thumb::Quaternion, 21> orientations{};
+    orientations[1] = {};
+    positions[1] = {};
+    for (int joint = 2; joint < 21; ++joint) {
+        Vec3 offset;
+        if (!GetJoint(hand_positions, joint, offset)) return false;
+        const int parent = parents[joint];
+        positions[joint] = AddVector(positions[parent], RotateVector(orientations[parent], offset));
+        orientations[joint] = MultiplyQuaternion(
+            orientations[parent],
+            glove_thumb::Mapper::EulerToQuaternion(rotations[joint], euler_order));
+    }
+    const int tip_indices[3] = {4, 8, 12};
+    for (int tip = 0; tip < 3; ++tip) {
+        feature[tip * 3] = positions[tip_indices[tip]].x;
+        feature[tip * 3 + 1] = positions[tip_indices[tip]].y;
+        feature[tip * 3 + 2] = positions[tip_indices[tip]].z;
+    }
+    return true;
+}
+
+static double AnchorDistance(
+    const std::array<double, 9>& left,
+    const std::array<double, 9>& right) {
+    double squared = 0.0;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const double delta = left[index] - right[index];
+        squared += delta * delta;
+    }
+    return std::sqrt(std::max(0.0, squared));
+}
+
+static void ApplyThumbPositionFusion(
+    const std::array<double, 9>& feature,
+    uint16_t out_targets[6]) {
+    g_last_thumb_position_fusion_debug = {};
+    if (!g_thumb_position_fusion.enabled) return;
+    const auto& index_anchor = g_gesture_anchors[0];
+    const auto& middle_anchor = g_gesture_anchors[1];
+    if (!index_anchor.enabled || !middle_anchor.enabled ||
+        index_anchor.targets[0] < 0 || index_anchor.targets[1] < 0 ||
+        middle_anchor.targets[0] < 0 || middle_anchor.targets[1] < 0) {
+        return;
+    }
+    auto contact_distances = [](const std::array<double, 9>& value) {
+        std::array<double, 2> result{};
+        for (std::size_t finger = 0; finger < 2; ++finger) {
+            double squared = 0.0;
+            const std::size_t other = (finger + 1) * 3;
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                const double delta = value[axis] - value[other + axis];
+                squared += delta * delta;
+            }
+            result[finger] = std::sqrt(std::max(0.0, squared));
+        }
+        return result;
+    };
+    const auto point = contact_distances(feature);
+    const auto start = contact_distances(index_anchor.tip_positions);
+    const auto end = contact_distances(middle_anchor.tip_positions);
+    const double dx = end[0] - start[0];
+    const double dy = end[1] - start[1];
+    const double length_squared = dx * dx + dy * dy;
+    if (length_squared < 1e-9) return;
+    const double segment_ratio = Clip(
+        ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared,
+        0.0, 1.0);
+    const double closest_x = start[0] + segment_ratio * dx;
+    const double closest_y = start[1] + segment_ratio * dy;
+    const double distance = std::hypot(point[0] - closest_x, point[1] - closest_y);
+    const double proximity = Clip(
+        1.0 - distance / g_thumb_position_fusion.support_radius, 0.0, 1.0);
+    const double weight = g_thumb_position_fusion.influence *
+        proximity * proximity * (3.0 - 2.0 * proximity);
+    auto fuse = [&](std::size_t channel) {
+        const double position_target = index_anchor.targets[channel] + segment_ratio *
+            (middle_anchor.targets[channel] - index_anchor.targets[channel]);
+        return static_cast<uint16_t>(std::lround(
+            (1.0 - weight) * out_targets[channel] + weight * position_target));
+    };
+    out_targets[0] = fuse(0);
+    out_targets[1] = fuse(1);
+    g_last_thumb_position_fusion_debug.valid = true;
+    g_last_thumb_position_fusion_debug.segment_ratio = segment_ratio;
+    g_last_thumb_position_fusion_debug.distance_to_segment = distance;
+    g_last_thumb_position_fusion_debug.weight = weight;
+    g_last_thumb_position_fusion_debug.pitch_target = out_targets[0];
+    g_last_thumb_position_fusion_debug.yaw_target = out_targets[1];
+}
+
+static uint16_t LogicalFingerTargetForHardwareTarget(std::size_t channel, uint16_t target) {
+    const std::uint32_t engage =
+        wa100_channel_layout::kFingerCloseEngageTargets[channel - wa100_channel_layout::kIndexFingerIndex];
+    const std::uint32_t logical =
+        (static_cast<std::uint32_t>(target) * 1999u + engage / 2u) / engage;
+    return static_cast<uint16_t>(std::min<std::uint32_t>(1999u, logical));
+}
+
+static void ApplyGestureAnchor(
+    const std::array<double, 9>& feature,
+    uint16_t out_targets[6]) {
+    const GestureAnchor* closest = nullptr;
+    double closest_distance = std::numeric_limits<double>::infinity();
+    for (const auto& anchor : g_gesture_anchors) {
+        if (!anchor.enabled || anchor.radius <= 1e-6) continue;
+        const double distance = AnchorDistance(feature, anchor.tip_positions);
+        if (distance < closest_distance) {
+            closest = &anchor;
+            closest_distance = distance;
+        }
+    }
+    if (closest == nullptr || closest_distance >= closest->radius) return;
+    double weight = 1.0 - closest_distance / closest->radius;
+    weight = weight * weight * (3.0 - 2.0 * weight);
+    for (std::size_t channel = 0; channel < 6; ++channel) {
+        if (closest->targets[channel] < 0) continue;
+        uint16_t desired = static_cast<uint16_t>(closest->targets[channel]);
+        if (channel >= wa100_channel_layout::kIndexFingerIndex) {
+            desired = LogicalFingerTargetForHardwareTarget(channel, desired);
+        }
+        out_targets[channel] = static_cast<uint16_t>(std::lround(
+            (1.0 - weight) * out_targets[channel] + weight * desired));
+    }
+}
+
 // Map Unity hand joints to physical WA100 order:
 // [ID1 thumb_pitch, ID2 thumb_yaw, ID3 index, ID4 middle, ID5 ring, ID6 pinky].
 static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     const char* rot_key = g_unity_hand_side == UnityHandSide::Left ? "leftRotations" : "rightRotations";
+    const char* pos_key = g_unity_hand_side == UnityHandSide::Left ? "leftPositions" : "rightPositions";
 
     if (!j.contains(rot_key) || !j[rot_key].is_array()) {
         return false;
@@ -735,6 +1050,14 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
     for (const auto& v : j[rot_key]) {
         if (!v.is_number()) return false;
         hand_rot.push_back(v.get<double>());
+    }
+    std::vector<double> hand_positions;
+    if (j.contains(pos_key) && j[pos_key].is_array()) {
+        hand_positions.reserve(j[pos_key].size());
+        for (const auto& value : j[pos_key]) {
+            if (!value.is_number()) return false;
+            hand_positions.push_back(value.get<double>());
+        }
     }
 
     if (hand_rot.size() < 63) {
@@ -764,6 +1087,12 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         const std::size_t base = joint_index * 3;
         rotations.push_back({hand_rot[base], hand_rot[base + 1], hand_rot[base + 2]});
     }
+    std::array<double, 9> gesture_feature{};
+    const bool has_gesture_feature = BuildHandLocalTipFeature(
+        hand_positions,
+        rotations,
+        g_glove_thumb_mapper.calibration().euler_order,
+        gesture_feature);
     g_last_thumb_mapping_debug = g_glove_thumb_mapper.Map(rotations);
     // Missing or invalid calibration fails safe for the two thumb motors only.
     const uint16_t thumb_yaw_target =
@@ -791,6 +1120,7 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         g_last_thumb_mapping_debug.pitch_target = thumb_pitch_target;
     }
     wa100_channel_layout::SetThumbTargets(thumb_pitch_target, thumb_yaw_target, out_targets);
+    if (has_gesture_feature) ApplyThumbPositionFusion(gesture_feature, out_targets);
 
     // Fingers: use weighted MCP/PIP rotation magnitude
     const auto& finger_calibration = g_four_finger_calibration;
@@ -858,6 +1188,8 @@ static bool MapUnityToTargets(const json& j, uint16_t out_targets[6]) {
         last_finger_targets[i] = *t;
     }
 
+    if (has_gesture_feature) ApplyGestureAnchor(gesture_feature, out_targets);
+
     return true;
 }
 
@@ -866,12 +1198,37 @@ static bool IsVrHandPacket(const json& j) {
            JsonStringContains(j, "jointFormat", "unity-xr-hands");
 }
 
+static bool MapCanonicalGoalToTargets(const json& j, uint16_t out_targets[6]) {
+    if (!JsonStringEquals(j, "type", "canonical_goal") || j.value("schema_version", 0) != 1) {
+        return false;
+    }
+    const auto validity = j.value("validity", json::object());
+    if (validity.value("hand_node_mask", 0u) == 0u) return false;
+    const auto final_targets = j.value("final_targets", json::object());
+    const auto targets = final_targets.value("hand_target_units", json::array());
+    if (!targets.is_array() || targets.size() != 6) return false;
+    for (std::size_t index = 0; index < 6; ++index) {
+        if (!targets[index].is_number()) return false;
+        const double value = targets[index].get<double>();
+        if (!std::isfinite(value) || value < 0.0 || value > 2000.0) return false;
+        out_targets[index] = static_cast<uint16_t>(std::lround(value));
+    }
+    return true;
+}
+
 static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[6]) {
     if (data == nullptr || len <= 0) return false;
 
     try {
         std::string payload(data, data + len);
         json j = json::parse(payload);
+
+        if (MapCanonicalGoalToTargets(j, out_targets)) {
+            // Compatibility targets have already passed the existing source
+            // mapper, including the one-time channel compensation. Applying it
+            // again here would make canonical and legacy outputs diverge.
+            return true;
+        }
 
         bool handled_control = false;
         if (ParseH5ControlPacket(j, out_targets, handled_control)) {
@@ -958,11 +1315,19 @@ void ComplianceControlLoop() {
 
         static bool first_run = true;
         if (first_run) {
+            uint16_t startup_actual[6];
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                memcpy(startup_actual, g_latest_actual_pos, sizeof(startup_actual));
+            }
             for (int i = 0; i < 6; i++) {
-                final_cmd[i] = desired_pos[i];
-                shaped_desired[i] = desired_pos[i];
-                desired_filters[i] = (double)desired_pos[i];
-                last_valid_pos[i] = desired_pos[i];
+                // Begin at measured feedback, then let the normal command
+                // shaper move toward the idle 2000 target. This preserves the
+                // deterministic open-on-start contract without a step jump.
+                final_cmd[i] = startup_actual[i];
+                shaped_desired[i] = startup_actual[i];
+                desired_filters[i] = (double)startup_actual[i];
+                last_valid_pos[i] = startup_actual[i];
             }
             first_run = false;
         }
@@ -982,6 +1347,10 @@ void ComplianceControlLoop() {
             current_feedback_valid[i] = feedback_valid && current_amp[i] <= INVALID_CURRENT_THRESHOLD;
             if (position_feedback_valid[i]) {
                 last_valid_pos[i] = current_pos[i];
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_latest_actual_pos[i] = current_pos[i];
+                }
                 if (position_zero_wrap_corrected[i]) {
                     static int zero_wrap_log_limit[6] = {0};
                     if (zero_wrap_log_limit[i]++ % 100 == 0) {
@@ -1362,7 +1731,20 @@ int main(int argc, char* argv[]) {
         std::cout << ">>> [安全配置] 所有关节硬件保护已生效" << std::endl;
     }
 
-    g_fast_driver.EnableAll();
+    uint16_t startup_feedback_position[6] = {2000, 2000, 2000, 2000, 2000, 2000};
+    uint16_t startup_current[6] = {0, 0, 0, 0, 0, 0};
+    if (!g_fast_driver.EnableAll(startup_feedback_position, startup_current)) {
+        std::cerr << ">>> Failed to enable WA100 and read startup position" << std::endl;
+        return -1;
+    }
+    const uint16_t startup_open_target[6] = {2000, 2000, 2000, 2000, 2000, 2000};
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        memcpy(g_latest_actual_pos, startup_feedback_position, sizeof(startup_feedback_position));
+        memcpy(g_udp_target_pos, startup_open_target, sizeof(startup_open_target));
+        memcpy(g_preset_target_pos, startup_open_target, sizeof(startup_open_target));
+    }
+    std::cout << ">>> [H5] control mode -> idle (forcing all encoders to 2000)" << std::endl;
 
     std::thread control_thread(ComplianceControlLoop);
 
@@ -1421,6 +1803,18 @@ int main(int argc, char* argv[]) {
             bool got_valid = false;
             int drained_packets = 0;
             auto process_packet = [&](const char* packet, int packet_len) {
+                bool canonical_packet = false;
+                bool native_hand_packet = false;
+                try {
+                    const json packet_kind = json::parse(std::string(packet, packet + packet_len));
+                    canonical_packet = JsonStringEquals(packet_kind, "type", "canonical_goal");
+                    const char* rotation_key = g_unity_hand_side == UnityHandSide::Left
+                        ? "leftRotations" : "rightRotations";
+                    const char* position_key = g_unity_hand_side == UnityHandSide::Left
+                        ? "leftPositions" : "rightPositions";
+                    native_hand_packet = packet_kind.contains(rotation_key) || packet_kind.contains(position_key);
+                } catch (...) {
+                }
                 const bool accepted = ParseUnityUdpPacket(packet, packet_len, temp_pos);
                 if (unity_input_log.is_open()) {
                     json record;
@@ -1452,12 +1846,20 @@ int main(int argc, char* argv[]) {
                         std::string source;
                         if (active_mode == ControlMode::Vr && is_vr_packet) {
                             source = "pico_hand";
-                        } else if (active_mode == ControlMode::Glove && !is_vr_packet) {
+                        } else if (active_mode == ControlMode::Glove && !is_vr_packet && !canonical_packet) {
                             source = "data_glove";
                         }
-                        if (!source.empty()) {
-                            native_payload["stream"] = "hand_skeleton";
-                            native_payload["source_timestamp_ns"] = GetCurrentTimeNs();
+                         if (!source.empty()) {
+                             native_payload["stream"] = "hand_skeleton";
+                             native_payload["source_timestamp_ns"] = GetCurrentTimeNs();
+                             native_payload["mapped_target_units"] =
+                                 std::vector<uint16_t>(temp_pos, temp_pos + 6);
+                             if (source == "data_glove") {
+                                 native_payload["glove_calibration_id"] =
+                                     g_glove_thumb_mapper.configured()
+                                     ? g_glove_thumb_mapper.calibration().calibration_id
+                                     : std::string();
+                             }
                             json envelope = {
                                 {"type", "raw_master_input"},
                                 {"schema_version", 1},
@@ -1474,9 +1876,14 @@ int main(int argc, char* argv[]) {
                         // Raw recording telemetry must never affect hand control.
                     }
                 }
+                // Native frames are compatibility-mapped for telemetry only.
+                // With canonical control enabled they reach the actuator solely
+                // after bridge validation as a canonical_goal packet.
                 if (accepted) {
-                    memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
-                    got_valid = true;
+                    if (!native_hand_packet || canonical_packet) {
+                        memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
+                        got_valid = true;
+                    }
                     if (alignment_glove_socket != INVALID_SOCKET || fusion_glove_socket != INVALID_SOCKET) {
                         // Versioned read-only Hi5 frame. Port 25005 remains dedicated
                         // to the calibration tool; port 25008 feeds runtime fusion so

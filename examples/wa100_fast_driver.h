@@ -131,6 +131,13 @@ public:
 
     // Enable all joints (Broadcast ID 0)
     bool EnableAll() {
+        return EnableAll(nullptr, nullptr);
+    }
+
+    // Enable all joints and return the status snapshot carried by the enable
+    // response.  The caller can use it as the initial hold target, avoiding a
+    // jump to a compile-time default before the first control-loop feedback.
+    bool EnableAll(uint16_t* startup_position, uint16_t* startup_current) {
         if (!connected) return false;
 
         // 1. Prepare Frame for CMD 0x04 (Enable)
@@ -159,13 +166,7 @@ public:
         std::vector<uint8_t> rx_buf;
         if (!RawRead(42, rx_buf)) return false;
 
-        // Basic validation
-        if (rx_buf[0] != 0x48 || rx_buf[1] != 0x4D) return false;
-        if (rx_buf[2] != 37) return false;
-        // Cmd echo Check (Should be 0x04)
-        if (rx_buf[3] != 0x04) return false;
-
-        return true;
+        return ParseResponse(rx_buf, startup_position, startup_current, 0x04);
     }
 
     // Protection: Set Current Limit (Cmd 0x07)
@@ -346,16 +347,18 @@ private:
         return true;
     }
 
-    bool ParseResponse(const std::vector<uint8_t>& packet, uint16_t* out_pos, uint16_t* out_cur) {
+    bool ParseResponse(
+        const std::vector<uint8_t>& packet,
+        uint16_t* out_pos,
+        uint16_t* out_cur,
+        uint8_t expected_cmd = 0x05) {
         // Validate Header
         if (packet[0] != 0x48 || packet[1] != 0x4D) return false;
         
         // Length should be 37
         if (packet[2] != 37) return false;
         
-        // Cmd should be 0x05 (or others returning status)
-        // Strictly speaking SyncWriteRead sends 0x05, receives 0x05.
-        if (packet[3] != 0x05) return false;
+        if (packet[3] != expected_cmd) return false;
         
         // Data payload starts at index 4
         // Format: 6 * {Pos(2), Cur(2), Temp(1), Err(1)} + Leak(1) = 36 + 1 = 37 bytes

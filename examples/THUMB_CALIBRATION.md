@@ -65,3 +65,13 @@ python examples/thumb_mapping_replay.py unity_input.jsonl build/bin/thumb_glove_
 ```
 
 运行时配置缺失或无效时，两个拇指通道保持安全张开值 2000，食指到小指继续工作。测试目录中的 `synthetic_thumb_calibration.json` 只能用于自动测试，禁止部署到真实手套。
+
+## 接触锚点（保留）
+
+schema 2 主映射完成后，可单独标定食指碰拇指和中指碰拇指：
+
+```powershell
+python examples/gesture_anchor_calibration.py --hand right
+```
+
+运行时仍以 schema 2 Rotation 映射为基础；接近两个锚点之间的 Position 轨迹时，最多以 80% 权重修正 ID1/ID2，进入锚点半径后再吸附对应的拇指和触碰手指目标。

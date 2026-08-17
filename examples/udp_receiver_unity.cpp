@@ -41,6 +41,7 @@ using json = nlohmann::json;
 #define RAW_MASTER_TELEMETRY_PORT 25009
 #define BUFFER_SIZE 65536
 #define MAX_UDP_DRAIN_PER_TICK 16
+#define CANONICAL_NATIVE_FALLBACK_TIMEOUT_MS 300
 
 bool IsCsvLoggingEnabled() {
     const char* value = std::getenv("WA100_ENABLE_CSV_LOG");
@@ -1769,6 +1770,9 @@ int main(int argc, char* argv[]) {
     raw_master_address.sin_addr.s_addr = inet_addr(RECORDING_TELEMETRY_IP);
     auto next_thumb_calibration_reload = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     std::string last_thumb_reload_error;
+    long long last_canonical_packet_ms = 0;
+    long long first_native_without_canonical_ms = 0;
+    bool native_fallback_active = false;
     if (IsUnityInputLoggingEnabled()) {
         const std::string input_log_path = GetLogPath("WA100_UNITY_INPUT_LOG_PATH", "unity_input_log.jsonl");
         unity_input_log.open(input_log_path, std::ios::out | std::ios::app);
@@ -1812,7 +1816,8 @@ int main(int argc, char* argv[]) {
                         ? "leftRotations" : "rightRotations";
                     const char* position_key = g_unity_hand_side == UnityHandSide::Left
                         ? "leftPositions" : "rightPositions";
-                    native_hand_packet = packet_kind.contains(rotation_key) || packet_kind.contains(position_key);
+                    native_hand_packet =
+                        packet_kind.contains(rotation_key) || packet_kind.contains(position_key);
                 } catch (...) {
                 }
                 const bool accepted = ParseUnityUdpPacket(packet, packet_len, temp_pos);
@@ -1876,11 +1881,41 @@ int main(int argc, char* argv[]) {
                         // Raw recording telemetry must never affect hand control.
                     }
                 }
-                // Native frames are compatibility-mapped for telemetry only.
-                // With canonical control enabled they reach the actuator solely
-                // after bridge validation as a canonical_goal packet.
                 if (accepted) {
-                    if (!native_hand_packet || canonical_packet) {
+                    bool apply_to_actuator = true;
+                    const long long packet_time_ms = GetCurrentTimeMs();
+                    if (canonical_packet) {
+                        last_canonical_packet_ms = packet_time_ms;
+                        first_native_without_canonical_ms = 0;
+                        if (native_fallback_active) {
+                            std::cout << ">>> [H5] Canonical recovered; native hand fallback disabled"
+                                      << std::endl;
+                        }
+                        native_fallback_active = false;
+                    } else if (native_hand_packet) {
+                        if (last_canonical_packet_ms > 0) {
+                            apply_to_actuator =
+                                packet_time_ms - last_canonical_packet_ms >
+                                CANONICAL_NATIVE_FALLBACK_TIMEOUT_MS;
+                        } else {
+                            if (first_native_without_canonical_ms == 0) {
+                                first_native_without_canonical_ms = packet_time_ms;
+                            }
+                            apply_to_actuator =
+                                packet_time_ms - first_native_without_canonical_ms >=
+                                CANONICAL_NATIVE_FALLBACK_TIMEOUT_MS;
+                        }
+                        if (apply_to_actuator && !native_fallback_active) {
+                            std::cerr << ">>> [H5] Canonical unavailable for "
+                                      << CANONICAL_NATIVE_FALLBACK_TIMEOUT_MS
+                                      << " ms; enabling validated native hand fallback" << std::endl;
+                        }
+                        native_fallback_active = apply_to_actuator;
+                    }
+                    // Control/preset packets always apply. Native hand frames apply
+                    // only during Canonical failure; a fresh Canonical packet is the
+                    // sole continuous actuator source during normal operation.
+                    if (apply_to_actuator) {
                         memcpy(latest_valid_pos, temp_pos, sizeof(temp_pos));
                         got_valid = true;
                     }

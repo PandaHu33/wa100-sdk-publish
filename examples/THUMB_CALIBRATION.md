@@ -75,3 +75,12 @@ python examples/gesture_anchor_calibration.py --hand right
 ```
 
 运行时仍以 schema 2 Rotation 映射为基础；接近两个锚点之间的 Position 轨迹时，最多以 80% 权重修正 ID1/ID2，进入锚点半径后再吸附对应的拇指和触碰手指目标。
+
+## PICO 手部识别的位置融合（Vr 模式）
+
+PICO（Unity XR Hands）链路在接收端 Vr 模式（`MapVrHandTrackingToTargets`）下同样启用拇指接触融合，逻辑与手套模式**共用同一个 `ApplyThumbPositionFusion`**：拇指指尖接近食指指尖或中指指尖时，把 ID1（pitch）/ID2（yaw）目标向标定锚点目标拉拢（拇指-食指碰 → 750/300，拇指-中指碰 → 750/0）。
+
+- **特征**：直接取 `rightPositions` 的关节 4/8/12（thumb/index/middle 指尖）构建 9 维特征，无需 rotation、无需手局部 FK 重建。融合算法只使用三个指尖的两两距离，平移/旋转不变，因此 PICO 的原始追踪坐标可直接使用。
+- **标定**：复用同一份 `thumb_glove_calibration.json` 中的 `gesture_anchors` + `thumb_position_fusion`（锚点是手局部几何，与输入源无关）。若 PICO 视觉手的骨骼尺度与 Hi5 手套差异导致相碰判定偏松/偏紧，需对 PICO 单独采集锚点（仿 `gesture_anchor_calibration.py`，但直接监听 UDP 25001 上的 `xr-hands` 包）。
+- **验证**：接收端 `unity_input_log` 在 Vr/Glove 两种模式都会记录 `thumb_position_fusion_debug`（valid / segment_ratio / distance_to_segment / weight / pitch_target / yaw_target），实机验证时观察相碰瞬间 weight 升高、目标趋向锚点值。
+- **执行链路**：直接跟随模式输出即融合后目标；canonical 模式下融合结果随 `mapped_target_units` 透传到从端执行，Python 侧不重算、不改动。

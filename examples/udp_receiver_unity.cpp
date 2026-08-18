@@ -315,6 +315,15 @@ struct VrHandCalibration {
 
 static const VrHandCalibration VR_HAND_CALIBRATION;
 
+// Defined below; used by MapVrHandTrackingToTargets to fuse thumb touch
+// anchors identically to the glove pipeline.
+static bool BuildPicoTipFeature(
+    const std::vector<double>& hand_positions,
+    std::array<double, 9>& feature);
+static void ApplyThumbPositionFusion(
+    const std::array<double, 9>& feature,
+    uint16_t out_targets[6]);
+
 static uint16_t RatioToTarget(double ratio, double sensitivity = 1.0) {
     double t = Clip(ratio, 0.0, 1.0);
     if (t <= VR_HAND_CALIBRATION.open_deadzone) {
@@ -413,6 +422,16 @@ static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
     const uint16_t thumb_pitch_target =
         RatioToTarget(thumb_pitch_ratio, VR_HAND_CALIBRATION.thumb_pitch_sensitivity);
     wa100_channel_layout::SetThumbTargets(thumb_pitch_target, thumb_yaw_target, out_targets);
+    // Thumb-index / thumb-middle touch fusion, identical to the glove
+    // pipeline: when the thumb tip approaches the index or middle tip the
+    // thumb pitch/yaw targets are pulled toward the calibrated touch anchors
+    // (gesture_anchors + thumb_position_fusion in the shared calibration
+    // JSON). Only pairwise tip distances are used, so raw PICO positions are
+    // sufficient; the anchors are hand-local geometry and source-independent.
+    std::array<double, 9> pico_tip_feature{};
+    if (BuildPicoTipFeature(hand_pos, pico_tip_feature)) {
+        ApplyThumbPositionFusion(pico_tip_feature, out_targets);
+    }
     out_targets[2] = RatioToTarget(FingerCurlRatio(hand_pos, 5, 6, 8, VR_HAND_CALIBRATION.index_open, VR_HAND_CALIBRATION.index_close));
     out_targets[3] = RatioToTarget(FingerCurlRatio(hand_pos, 9, 10, 12, VR_HAND_CALIBRATION.middle_open, VR_HAND_CALIBRATION.middle_close));
     out_targets[4] = RatioToTarget(FingerCurlRatio(hand_pos, 13, 14, 16, VR_HAND_CALIBRATION.ring_open, VR_HAND_CALIBRATION.ring_close));
@@ -552,6 +571,17 @@ static json ThumbMappingDebugToJson(const glove_thumb::MappingDebug& debug) {
         {"pitch_ratio", debug.pitch_ratio},
         {"yaw_target", debug.yaw_target},
         {"pitch_target", debug.pitch_target},
+    };
+}
+
+static json ThumbPositionFusionDebugToJson(const ThumbPositionFusionDebug& debug) {
+    return {
+        {"valid", debug.valid},
+        {"segment_ratio", debug.segment_ratio},
+        {"distance_to_segment", debug.distance_to_segment},
+        {"weight", debug.weight},
+        {"pitch_target", debug.pitch_target},
+        {"yaw_target", debug.yaw_target},
     };
 }
 
@@ -928,6 +958,27 @@ static bool BuildHandLocalTipFeature(
         feature[tip * 3] = positions[tip_indices[tip]].x;
         feature[tip * 3 + 1] = positions[tip_indices[tip]].y;
         feature[tip * 3 + 2] = positions[tip_indices[tip]].z;
+    }
+    return true;
+}
+
+// PICO XR Hands supplies joint positions in the same 21-joint layout as the
+// glove pipeline (0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, ...). The thumb
+// position fusion feature only needs the thumb/index/middle tips (joints
+// 4/8/12); ApplyThumbPositionFusion reduces it to pairwise tip distances,
+// which are translation- and rotation-invariant, so raw tracking positions
+// are usable directly without hand-local FK reconstruction.
+static bool BuildPicoTipFeature(
+    const std::vector<double>& hand_positions,
+    std::array<double, 9>& feature) {
+    if (hand_positions.size() < 63) return false;
+    static const int tip_indices[3] = {4, 8, 12};
+    for (int tip = 0; tip < 3; ++tip) {
+        Vec3 tip_pos;
+        if (!GetJoint(hand_positions, tip_indices[tip], tip_pos)) return false;
+        feature[tip * 3] = tip_pos.x;
+        feature[tip * 3 + 1] = tip_pos.y;
+        feature[tip * 3 + 2] = tip_pos.z;
     }
     return true;
 }
@@ -1836,6 +1887,11 @@ int main(int argc, char* argv[]) {
                         if (accepted && parsed_payload.contains(rotation_key) &&
                             (ControlMode)g_control_mode.load() == ControlMode::Glove) {
                             record["thumb_mapping_debug"] = ThumbMappingDebugToJson(g_last_thumb_mapping_debug);
+                        }
+                        if (accepted && g_thumb_position_fusion.enabled &&
+                            (parsed_payload.contains(rotation_key) || parsed_payload.contains(position_key))) {
+                            record["thumb_position_fusion_debug"] =
+                                ThumbPositionFusionDebugToJson(g_last_thumb_position_fusion_debug);
                         }
                     } catch (...) {
                         record["raw_payload"] = std::string(packet, packet + packet_len);

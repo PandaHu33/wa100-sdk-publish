@@ -113,7 +113,7 @@ def main() -> int:
 
     targets = {
         "thumb_index_touch": {"1": 750, "2": 300, "3": 350},
-        "thumb_middle_touch": {"1": 750, "2": 0, "4": 350},
+        "thumb_middle_touch": {"1": 800, "2": 0, "4": 350},
     }
     anchors = {}
     for key, _instruction in STAGES:

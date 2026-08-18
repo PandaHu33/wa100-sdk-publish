@@ -1884,6 +1884,8 @@ int main(int argc, char* argv[]) {
                         record["unity_payload"] = parsed_payload;
                         const char* rotation_key = g_unity_hand_side == UnityHandSide::Left
                             ? "leftRotations" : "rightRotations";
+                        const char* position_key = g_unity_hand_side == UnityHandSide::Left
+                            ? "leftPositions" : "rightPositions";
                         if (accepted && parsed_payload.contains(rotation_key) &&
                             (ControlMode)g_control_mode.load() == ControlMode::Glove) {
                             record["thumb_mapping_debug"] = ThumbMappingDebugToJson(g_last_thumb_mapping_debug);

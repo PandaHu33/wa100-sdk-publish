@@ -365,8 +365,13 @@ private:
         const uint8_t* data = &packet[4];
         uint8_t err_snapshot[6] = {0};
         
+        // 固件 0x05/0x04 响应帧把拇指两通道按 [yaw, pitch] 排列，与命令帧
+        // [pitch, yaw] 相反（2026-08-21 实机验证：命令槽位0 驱动 ID1=弯曲，
+        // 而响应槽位0 返回的是 ID2=横摇）。这里按物理 ID 顺序还原，保证
+        // out_pos/out_cur 与命令槽位同序：out[i] 恒为 ID(i+1) 的反馈。
         for (int i=0; i<6; i++) {
-            int offset = i * 6;
+            const int slot = (i == 0) ? 1 : (i == 1) ? 0 : i;
+            int offset = slot * 6;
             // Pos
             uint16_t p = data[offset] | (data[offset+1] << 8);
             if (out_pos) out_pos[i] = p;

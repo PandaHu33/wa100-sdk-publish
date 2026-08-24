@@ -84,6 +84,15 @@ enum class ControlMode {
     Preset = 3,
 };
 
+// Independent admittance policy.  Shares no state with ControlMode: switching
+// only changes how loaded channels retreat, never the target source.
+enum class AdmMode {
+    Off = 0,        // position following + 900/850 mA per-channel software latch
+    HandOnly = 1,   // legacy one-way second-order admittance (previous behaviour)
+    Holistic = 2,   // config-modulated admittance + global arm/hand retreat evidence
+    HandConfig = 3, // config-modulated admittance, no arm-side retreat evidence
+};
+
 struct SerialSettings {
     std::string port = "COM4";
     uint32_t baudrate = 1000000;
@@ -95,6 +104,11 @@ uint16_t g_udp_target_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 uint16_t g_preset_target_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 std::atomic<long long> g_last_udp_pkt_time = 0;
 std::atomic<int> g_control_mode((int)ControlMode::Idle);
+// Fail-safe startup: local admittance is opt-in.  The control UI may
+// explicitly restore HandOnly while central semantic admittance is OFF.
+std::atomic<int> g_adm_mode((int)AdmMode::Off);
+std::atomic<double> g_retreat_level(0.0);
+std::atomic<bool> g_retreat_active(false);
 uint16_t g_latest_actual_pos[6] = {2000, 2000, 2000, 2000, 2000, 2000};
 bool g_running = true;
 UnityHandSide g_unity_hand_side = UnityHandSide::Right;
@@ -177,6 +191,18 @@ const double DESIRED_SLEW_RATE = 4500.0;
 const double MAX_ADMITTANCE_VEL = 3500.0;
 const double MAX_ADMITTANCE_OFFSET = 1800.0;
 const uint16_t INVALID_CURRENT_THRESHOLD = 10000;
+
+// --- Admittance policy constants (Off / HandOnly / Holistic / HandConfig) ---
+const uint16_t OFF_LATCH_ON_MA = 900;            // Off mode: latch actual position above this
+const uint16_t OFF_LATCH_OFF_MA = 850;           // release when raw & filtered fall below this
+const double CLOSURE_GAIN_OPEN_SCALE = 1.5;      // gain scale at c=0 (1.5 - 0.5*c at c=1)
+const double CLOSURE_TRIGGER_OPEN_DROP_MA = 100.0; // trigger_on at c=0 = 500 - 100*(1-c)
+const double RETREAT_WEIGHT_COUNT = 0.4;
+const double RETREAT_WEIGHT_PEAK = 0.6;
+const double RETREAT_LOWPASS_TAU_SEC = 0.1;
+const double RETREAT_ON_HYSTERESIS = 0.25;
+const double RETREAT_OFF_HYSTERESIS = 0.12;
+const double LOAD_EVIDENCE_COUNT_THRESHOLD = 0.5;
 
 struct SecondOrderState {
     double offset = 0.0;
@@ -268,6 +294,40 @@ static const char* ControlModeToString(ControlMode mode) {
     if (mode == ControlMode::Vr) return "vr";
     if (mode == ControlMode::Preset) return "preset";
     return "glove";
+}
+
+static const char* AdmModeToString(AdmMode mode) {
+    switch (mode) {
+        case AdmMode::Off: return "off";
+        case AdmMode::HandOnly: return "handonly";
+        case AdmMode::Holistic: return "holistic";
+        case AdmMode::HandConfig: return "handconfig";
+    }
+    return "unknown";
+}
+
+// Accepts only {"type":"set_admittance_mode","schema_version":1,"mode":0|1|2|3}.
+// Mode-only packets never produce actuator targets; they only switch the
+// admittance policy consumed by the control thread.
+static bool ParseAdmittanceModePacket(const json& j) {
+    if (!j.is_object() || !j.contains("type") || !j["type"].is_string()) return false;
+    if (j["type"].get<std::string>() != "set_admittance_mode") return false;
+    if (j.value("schema_version", 0) != 1 || !j.contains("mode") || !j["mode"].is_number_integer()) {
+        std::cerr << ">>> [AdmMode] rejected packet (schema_version must be 1, mode must be integer)" << std::endl;
+        return true;
+    }
+    const int value = j["mode"].get<int>();
+    if (value < 0 || value > 3) {
+        std::cerr << ">>> [AdmMode] rejected out-of-range mode " << value << std::endl;
+        return true;
+    }
+    const AdmMode next = (AdmMode)value;
+    const AdmMode previous = (AdmMode)g_adm_mode.exchange(value);
+    if (previous != next) {
+        std::cout << ">>> [AdmMode] admittance mode -> " << AdmModeToString(next)
+                  << " (was " << AdmModeToString(previous) << ")" << std::endl;
+    }
+    return true;
 }
 
 static bool ParseHandSideArg(const char* arg, UnityHandSide& out_side) {
@@ -1251,11 +1311,13 @@ static bool IsVrHandPacket(const json& j) {
 }
 
 static bool MapCanonicalGoalToTargets(const json& j, uint16_t out_targets[6]) {
-    if (!JsonStringEquals(j, "type", "canonical_goal") || j.value("schema_version", 0) != 1) {
+    const int schema_version = j.value("schema_version", 0);
+    if (!JsonStringEquals(j, "type", "canonical_goal") ||
+        schema_version != 4) {
         return false;
     }
     const auto validity = j.value("validity", json::object());
-    if (validity.value("hand_node_mask", 0u) == 0u) return false;
+    if (validity.value("hand_dof_mask", 0u) == 0u) return false;
     const auto final_targets = j.value("final_targets", json::object());
     const auto targets = final_targets.value("hand_target_units", json::array());
     if (!targets.is_array() || targets.size() != 6) return false;
@@ -1274,6 +1336,11 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
     try {
         std::string payload(data, data + len);
         json j = json::parse(payload);
+
+        // Mode-only packet: switch the admittance policy, never produce targets.
+        if (ParseAdmittanceModePacket(j)) {
+            return false;
+        }
 
         if (MapCanonicalGoalToTargets(j, out_targets)) {
             // Compatibility targets have already passed the existing source
@@ -1325,12 +1392,29 @@ void ComplianceControlLoop() {
     double desired_filters[6] = {0.0};
     double filtered_amp[6] = {0.0};
 
+    // --- Admittance policy state (consumed only by this thread) ---
+    int previous_adm_mode = g_adm_mode.load();
+    bool force_trigger_state[6] = {false};
+    bool off_hold_active[6] = {false};
+    uint16_t off_hold_pos[6] = {0};
+    double closure_ratio[6] = {0.0};
+    double gain_scale[6] = {1.0};
+    int adm_trigger_on[6] = {FORCE_THRESHOLD, FORCE_THRESHOLD, FORCE_THRESHOLD,
+                             FORCE_THRESHOLD, FORCE_THRESHOLD, FORCE_THRESHOLD};
+    int adm_trigger_off[6] = {FORCE_THRESHOLD - 200, FORCE_THRESHOLD - 200, FORCE_THRESHOLD - 200,
+                              FORCE_THRESHOLD - 200, FORCE_THRESHOLD - 200, FORCE_THRESHOLD - 200};
+    double channel_load_evidence[6] = {0.0};
+    int loaded_channel_count = 0;
+    double load_peak = 0.0;
+    double retreat_level_filtered = 0.0;
+
     std::ofstream log_file;
     if (IsCsvLoggingEnabled()) {
         log_file.open(GetLogPath("WA100_CSV_LOG_PATH", "admittance_log.csv"));
     }
     if (log_file.is_open()) {
-        log_file << "TIME,WALL_TIME_MS,ID,RAW_DESIRED,SHAPED_DESIRED,CMD,REAL,AMP,OFFSET\n";
+        log_file << "TIME,WALL_TIME_MS,ID,RAW_DESIRED,SHAPED_DESIRED,CMD,REAL,AMP,OFFSET"
+                 << ",ADM_MODE,CLOSURE,RETREAT_LEVEL,OFF_HOLD,GAIN_SCALE,TRIG_ON,TRIG_OFF,LOAD_EVIDENCE\n";
         std::cout << ">>> 日志文件已创建: admittance_log.csv" << std::endl;
     } else if (IsCsvLoggingEnabled()) {
         std::cerr << ">>> 警告: 无法创建日志文件" << std::endl;
@@ -1363,6 +1447,33 @@ void ComplianceControlLoop() {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             memcpy(desired_pos, g_udp_target_pos, sizeof(desired_pos));
+        }
+
+        // --- Bumpless admittance mode switching (consumed by this thread) ---
+        const int adm_mode = g_adm_mode.load();
+        if (adm_mode != previous_adm_mode) {
+            const bool crossing_off =
+                adm_mode == (int)AdmMode::Off || previous_adm_mode == (int)AdmMode::Off;
+            for (int i = 0; i < 6; i++) {
+                states[i].velocity = 0.0;
+                if (crossing_off) {
+                    // Re-anchor the command shaper to the last valid feedback so
+                    // entering/leaving Off never produces a step jump.
+                    states[i].offset = 0.0;
+                    desired_filters[i] = (double)last_valid_pos[i];
+                }
+                // A1 <-> A3 <-> A2 keep the continuous legacy state on purpose.
+                off_hold_active[i] = false;
+                channel_load_evidence[i] = 0.0;
+            }
+            loaded_channel_count = 0;
+            load_peak = 0.0;
+            retreat_level_filtered = 0.0;
+            g_retreat_level.store(0.0);
+            g_retreat_active.store(false);
+            std::cout << ">>> [AdmMode] control loop applying "
+                      << AdmModeToString((AdmMode)adm_mode) << std::endl;
+            previous_adm_mode = adm_mode;
         }
 
         static bool first_run = true;
@@ -1436,6 +1547,40 @@ void ComplianceControlLoop() {
             desired_filters[i] += delta;
             shaped_desired[i] = Clamp((int)std::lround(desired_filters[i]), 0, 2000);
 
+            // --- Per-channel admittance policy ---
+            const double closure = std::max(0.0, std::min(1.0, (2000.0 - (double)current_pos[i]) / 2000.0));
+            closure_ratio[i] = closure;
+
+            if (adm_mode == (int)AdmMode::Off) {
+                // Position following with a 900/850 mA software current latch:
+                // hold the actual position while raw or filtered current is above
+                // the latch threshold, release only after both fall back below.
+                // No soft release / admittance dynamics in Off mode: the latch is
+                // the only compliance behaviour so logs and state stay clean.
+                const double raw = (double)current_amp[i];
+                if (current_feedback_valid[i] &&
+                    (raw > OFF_LATCH_ON_MA || filtered_amp[i] > OFF_LATCH_ON_MA)) {
+                    if (!off_hold_active[i]) {
+                        static int off_latch_log_limit[6] = {0};
+                        if (off_latch_log_limit[i]++ % 20 == 0)
+                            std::cerr << ">>> [AdmMode Off] ID " << i + 1 << " current latch at "
+                                      << (int)std::lround(filtered_amp[i]) << "mA" << std::endl;
+                    }
+                    off_hold_active[i] = true;
+                    off_hold_pos[i] = current_pos[i];
+                } else if (off_hold_active[i] && current_feedback_valid[i] &&
+                           raw < OFF_LATCH_OFF_MA && filtered_amp[i] < OFF_LATCH_OFF_MA) {
+                    off_hold_active[i] = false;
+                    static int off_release_log_limit[6] = {0};
+                    if (off_release_log_limit[i]++ % 20 == 0)
+                        std::cerr << ">>> [AdmMode Off] ID " << i + 1 << " current latch released" << std::endl;
+                }
+                local_soft_release_active[i] = false;
+                final_cmd[i] = off_hold_active[i] ? off_hold_pos[i] : shaped_desired[i];
+                continue;
+            }
+
+            // Soft release / admittance dynamics only run outside Off mode.
             local_soft_release_active[i] = current_feedback_valid[i] &&
                 (current_amp[i] > SOFT_CURRENT_RELEASE_MA || filtered_amp[i] > SOFT_CURRENT_RELEASE_MA);
             if (local_soft_release_active[i]) {
@@ -1449,10 +1594,24 @@ void ComplianceControlLoop() {
 
             double f_ext = 0.0;
             bool is_under_force = false;
-            static bool force_trigger_state[6] = {false};
+            double force_gain = FORCE_GAIN;
             int trigger_on = FORCE_THRESHOLD;
             int trigger_off = FORCE_THRESHOLD - 200;
             if (trigger_off < 0) trigger_off = 0;
+
+            if (adm_mode == (int)AdmMode::Holistic || adm_mode == (int)AdmMode::HandConfig) {
+                // Configuration-modulated admittance: retreat earlier and softer
+                // while the channel is still open, keep legacy behaviour once closed.
+                gain_scale[i] = CLOSURE_GAIN_OPEN_SCALE - 0.5 * closure;  // 1.5 - 0.5*c
+                force_gain = FORCE_GAIN * gain_scale[i];
+                trigger_on = (int)std::lround(
+                    FORCE_THRESHOLD - CLOSURE_TRIGGER_OPEN_DROP_MA * (1.0 - closure));
+                trigger_off = std::max(0, trigger_on - 200);
+            } else {
+                gain_scale[i] = 1.0;
+            }
+            adm_trigger_on[i] = trigger_on;
+            adm_trigger_off[i] = trigger_off;
 
             if (current_feedback_valid[i]) {
                 if (filtered_amp[i] > trigger_on)
@@ -1464,7 +1623,7 @@ void ComplianceControlLoop() {
             if (force_trigger_state[i]) {
                 // Tendon-driven one-way admittance:
                 // only pulling load produces meaningful current, so only positive retreat is allowed.
-                f_ext = (filtered_amp[i] - (double)trigger_off) * FORCE_GAIN;
+                f_ext = (filtered_amp[i] - (double)trigger_off) * force_gain;
                 if (filtered_amp[i] > SOFT_CURRENT_WARN_MA) {
                     double soft_span = (double)(SOFT_CURRENT_RELEASE_MA - SOFT_CURRENT_WARN_MA);
                     if (soft_span < 1.0) soft_span = 1.0;
@@ -1472,6 +1631,19 @@ void ComplianceControlLoop() {
                     f_ext *= Clip(soft_scale, 0.2, 1.0);
                 }
                 is_under_force = true;
+            }
+
+            // --- Per-channel load evidence (0..1, low-passed with 0.1 s tau) ---
+            const double evidence_target = (force_trigger_state[i] && current_feedback_valid[i])
+                ? std::max(0.0, std::min(1.0,
+                    (filtered_amp[i] - (double)trigger_off) /
+                    std::max(1.0, (double)SOFT_CURRENT_RELEASE_MA - (double)trigger_off)))
+                : 0.0;
+            const double evidence_alpha = real_dt / (RETREAT_LOWPASS_TAU_SEC + real_dt);
+            if (adm_mode == (int)AdmMode::Holistic) {
+                channel_load_evidence[i] += (evidence_target - channel_load_evidence[i]) * evidence_alpha;
+            } else {
+                channel_load_evidence[i] = 0.0;
             }
 
             double effective_damp = is_under_force ? SYS_DAMP : (SYS_DAMP * 6.0);
@@ -1499,6 +1671,52 @@ void ComplianceControlLoop() {
             final_cmd[i] = Clamp(compliant_target, 0, 2000);
         }
 
+        // =====================================================================
+        // TEMP PATCH (2026-08-21): floor the final ID1 (thumb pitch) encoder
+        // command at 100 units.  Below 100 the tendon stays in a persistent
+        // overcurrent state and can never reach 0; clamping the final command
+        // before SyncWriteRead lets the cable unload.  Applies to every mode
+        // (Off latch included) because it sits after all per-channel branches.
+        // Channel semantics verified on hardware 2026-08-21 by a sweep test:
+        // ID1 = thumb pitch (flexion), ID2 = thumb yaw (opposition), so this
+        // floor targets the flexion tendon that had the overcurrent issue.
+        // Remove this block once the tendon/mechanical issue is resolved.
+        // =====================================================================
+        if (final_cmd[0] < 100) {
+            static int id1_floor_log_limit = 0;
+            if (id1_floor_log_limit++ % 200 == 0)
+                std::cerr << ">>> [TEMP PATCH ID1] final command floored to 100 (was "
+                          << final_cmd[0] << ")" << std::endl;
+            final_cmd[0] = 100;
+        }
+
+        // --- Global holistic retreat evidence (mode 2 only) ---
+        if (adm_mode == (int)AdmMode::Holistic) {
+            loaded_channel_count = 0;
+            load_peak = 0.0;
+            for (int i = 0; i < 6; i++) {
+                if (channel_load_evidence[i] > LOAD_EVIDENCE_COUNT_THRESHOLD) loaded_channel_count++;
+                if (channel_load_evidence[i] > load_peak) load_peak = channel_load_evidence[i];
+            }
+            const double target_level =
+                RETREAT_WEIGHT_COUNT * ((double)loaded_channel_count / 6.0) +
+                RETREAT_WEIGHT_PEAK * load_peak;
+            const double retreat_alpha = real_dt / (RETREAT_LOWPASS_TAU_SEC + real_dt);
+            retreat_level_filtered += (target_level - retreat_level_filtered) * retreat_alpha;
+            const bool was_active = g_retreat_active.load();
+            const bool now_active = was_active
+                ? retreat_level_filtered >= RETREAT_OFF_HYSTERESIS
+                : retreat_level_filtered >= RETREAT_ON_HYSTERESIS;
+            g_retreat_level.store(retreat_level_filtered);
+            g_retreat_active.store(now_active);
+        } else {
+            g_retreat_level.store(0.0);
+            g_retreat_active.store(false);
+            retreat_level_filtered = 0.0;
+            loaded_channel_count = 0;
+            load_peak = 0.0;
+        }
+
         if (log_file.is_open()) {
             auto now_log = std::chrono::steady_clock::now();
             while (now_log >= next_log_time) {
@@ -1508,7 +1726,12 @@ void ComplianceControlLoop() {
                     log_file << sample_time_ms << "," << wall_time_ms << ",ID" << (i + 1) << ","
                              << desired_pos[i] << "," << shaped_desired[i] << "," << final_cmd[i] << ","
                              << current_pos[i] << "," << (int)std::lround(filtered_amp[i]) << ","
-                             << (int)std::lround(states[i].offset) << "\n";
+                             << (int)std::lround(states[i].offset) << ","
+                             << AdmModeToString((AdmMode)adm_mode) << ","
+                             << closure_ratio[i] << "," << g_retreat_level.load() << ","
+                             << (off_hold_active[i] ? 1 : 0) << "," << gain_scale[i] << ","
+                             << adm_trigger_on[i] << "," << adm_trigger_off[i] << ","
+                             << channel_load_evidence[i] << "\n";
                 }
                 ++log_sample_index;
                 next_log_time += std::chrono::milliseconds(kLogPeriodMs);
@@ -1527,7 +1750,7 @@ void ComplianceControlLoop() {
         if (telemetry_now >= next_telemetry_time && telemetry_socket != INVALID_SOCKET) {
             json telemetry;
             telemetry["type"] = "wa100_recording_state";
-            telemetry["schema_version"] = 3;
+            telemetry["schema_version"] = 4;
             telemetry["channel_names"] = {
                 "thumb_pitch", "thumb_yaw", "index", "middle", "ring", "pinky",
             };
@@ -1535,6 +1758,9 @@ void ComplianceControlLoop() {
             telemetry["source_time_ns"] = GetCurrentTimeNs();
             telemetry["source_monotonic_ns"] = GetSteadyTimeNs();
             telemetry["control_mode"] = ControlModeToString((ControlMode)g_control_mode.load());
+            telemetry["admittance_mode"] = AdmModeToString((AdmMode)adm_mode);
+            telemetry["retreat_level"] = g_retreat_level.load();
+            telemetry["retreat_active"] = g_retreat_active.load();
             telemetry["feedback_valid"] = feedback_valid;
             telemetry["position_valid"] = std::vector<bool>(position_feedback_valid, position_feedback_valid + 6);
             telemetry["position_zero_wrap_corrected"] =
@@ -1550,11 +1776,25 @@ void ComplianceControlLoop() {
             telemetry["compliance_offset_units"] = offsets;
             telemetry["local_soft_release_active"] =
                 std::vector<bool>(local_soft_release_active, local_soft_release_active + 6);
+            telemetry["off_hold_active"] =
+                std::vector<bool>(off_hold_active, off_hold_active + 6);
+            // Holistic / HandConfig debugging arrays; explicitly zeroed outside
+            // those modes by the policy loop.
+            telemetry["admittance_closure"] = std::vector<double>(closure_ratio, closure_ratio + 6);
+            telemetry["admittance_gain_scale"] = std::vector<double>(gain_scale, gain_scale + 6);
+            telemetry["admittance_trigger_on_ma"] =
+                std::vector<int>(adm_trigger_on, adm_trigger_on + 6);
+            telemetry["admittance_trigger_off_ma"] =
+                std::vector<int>(adm_trigger_off, adm_trigger_off + 6);
+            telemetry["channel_load_evidence"] =
+                std::vector<double>(channel_load_evidence, channel_load_evidence + 6);
             telemetry["local_protection"] = {
                 {"hard_current_limit_ma", HARD_CURRENT_LIMIT_MA},
                 {"soft_current_warn_ma", SOFT_CURRENT_WARN_MA},
                 {"soft_current_release_ma", SOFT_CURRENT_RELEASE_MA},
                 {"one_way_unloading_preserved", true},
+                {"off_latch_on_ma", OFF_LATCH_ON_MA},
+                {"off_latch_off_ma", OFF_LATCH_OFF_MA},
             };
             telemetry["current_semantics"] = "motor_current_load_proxy_not_force_or_tactile";
             const std::string encoded = telemetry.dump();
@@ -1728,6 +1968,9 @@ int main(int argc, char* argv[]) {
     std::cout << ">>> tendon-driven mode: one-way admittance only, soft current band "
               << SOFT_CURRENT_WARN_MA << "-" << SOFT_CURRENT_RELEASE_MA
               << "mA, hardware limit " << HARD_CURRENT_LIMIT_MA << "mA" << std::endl;
+    std::cout << ">>> initial admittance mode: "
+              << AdmModeToString((AdmMode)g_adm_mode.load())
+              << " (off=0, handonly=1, holistic=2, handconfig=3)" << std::endl;
 
     g_fast_driver.RegisterCurrentCallback([](uint8_t id, uint8_t code) {
         std::cerr << ">>> [严重警报] 关节 " << (int)id << " 触发过流保护 (OverCurrent)! 错误码: " << (int)code

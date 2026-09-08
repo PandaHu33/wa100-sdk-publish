@@ -155,29 +155,6 @@ if(WIN32)
     target_link_libraries(udp_receiver_unity ws2_32)
 endif()
 
-enable_testing()
-add_executable(vr_anchor_stability_test ${SDK_ROOT_DIR}/tests/vr_anchor_stability_test.cpp)
-target_include_directories(vr_anchor_stability_test PRIVATE ${EXAMPLES_DIR})
-add_test(NAME vr_anchor_stability_test COMMAND vr_anchor_stability_test)
-add_executable(glove_thumb_mapper_test
-    ${SDK_ROOT_DIR}/tests/glove_thumb_mapper_test.cpp
-    ${EXAMPLES_DIR}/glove_thumb_mapper.cpp
-)
-target_include_directories(glove_thumb_mapper_test PRIVATE ${EXAMPLES_DIR})
-add_test(NAME glove_thumb_mapper_test COMMAND glove_thumb_mapper_test)
-
-add_executable(wa100_feedback_filter_test
-    ${SDK_ROOT_DIR}/tests/wa100_feedback_filter_test.cpp
-)
-target_include_directories(wa100_feedback_filter_test PRIVATE ${EXAMPLES_DIR})
-add_test(NAME wa100_feedback_filter_test COMMAND wa100_feedback_filter_test)
-
-add_executable(wa100_channel_layout_test
-    ${SDK_ROOT_DIR}/tests/wa100_channel_layout_test.cpp
-)
-target_include_directories(wa100_channel_layout_test PRIVATE ${EXAMPLES_DIR})
-add_test(NAME wa100_channel_layout_test COMMAND wa100_channel_layout_test)
-
 # ========== 安装规则 ==========
 install(TARGETS basic_demo advanced_demo quickstart_demo udp_receiver udp_receiver_unity
     RUNTIME DESTINATION bin

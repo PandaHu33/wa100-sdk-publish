@@ -10,6 +10,7 @@
 #include "glove_thumb_mapper.h"
 #include "wa100_channel_layout.h"
 #include "wa100_feedback_filter.h"
+#include "vr_anchor_stability.h"
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +32,9 @@
 #pragma comment(lib, "ws2_32.lib")
 
 using json = nlohmann::json;
+static constexpr const char* VR_ACQUISITION_BUILD = "vr-palm-local-thumb-deadband-v4";
+static VrAnchorStability g_vr_anchor_stability;
+static double g_vr_anchor_sample_time = 0.0;
 
 #define UDP_IP "127.0.0.1"
 #define PORT 25001
@@ -382,7 +386,7 @@ static bool BuildPicoTipFeature(
     std::array<double, 9>& feature);
 static void ApplyThumbPositionFusion(
     const std::array<double, 9>& feature,
-    uint16_t out_targets[6]);
+    uint16_t out_targets[6], bool stabilize_vr = false);
 
 static uint16_t RatioToTarget(double ratio, double sensitivity = 1.0) {
     double t = Clip(ratio, 0.0, 1.0);
@@ -429,6 +433,19 @@ static double FingerCurlRatio(
 // This path is selected only for packets marked as Unity XR Hands and does not
 // reuse the legacy/data-glove Euler calibration in MapUnityToTargets().
 static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
+    const bool left = g_unity_hand_side == UnityHandSide::Left;
+    if (!j.value(left ? "leftTracked" : "rightTracked", true)) {
+        g_vr_anchor_stability.reset(); return false;
+    }
+    static long long last_generation = -1;
+    const auto filter_info = j.value("xrSkeletonFilter", json::object());
+    const long long generation = filter_info.value(left ? "left_generation" : "right_generation", -1LL);
+    if (generation != last_generation) g_vr_anchor_stability.reset();
+    last_generation = generation;
+    g_vr_anchor_sample_time = j.value("bridgeRecvTime", 0.0);
+    if (!std::isfinite(g_vr_anchor_sample_time) || g_vr_anchor_sample_time <= 0.0)
+        g_vr_anchor_sample_time = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     const char* pos_key = g_unity_hand_side == UnityHandSide::Left ? "leftPositions" : "rightPositions";
 
     if (!j.contains(pos_key) || !j[pos_key].is_array()) {
@@ -439,7 +456,9 @@ static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
     hand_pos.reserve(j[pos_key].size());
     for (const auto& v : j[pos_key]) {
         if (!v.is_number()) return false;
-        hand_pos.push_back(v.get<double>());
+        const double coordinate = v.get<double>();
+        if (!std::isfinite(coordinate)) { g_vr_anchor_stability.reset(); return false; }
+        hand_pos.push_back(coordinate);
     }
 
     if (hand_pos.size() < 63) {
@@ -477,6 +496,8 @@ static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
         VR_HAND_CALIBRATION.thumb_pitch_open,
         VR_HAND_CALIBRATION.thumb_pitch_close);
 
+    g_vr_anchor_stability.filter_thumb_features(thumb_pitch_ratio, thumb_yaw_ratio, g_vr_anchor_sample_time);
+
     const uint16_t thumb_yaw_target =
         RatioToTarget(thumb_yaw_ratio, VR_HAND_CALIBRATION.thumb_yaw_sensitivity);
     const uint16_t thumb_pitch_target =
@@ -490,7 +511,7 @@ static bool MapVrHandTrackingToTargets(const json& j, uint16_t out_targets[6]) {
     // sufficient; the anchors are hand-local geometry and source-independent.
     std::array<double, 9> pico_tip_feature{};
     if (BuildPicoTipFeature(hand_pos, pico_tip_feature)) {
-        ApplyThumbPositionFusion(pico_tip_feature, out_targets);
+        ApplyThumbPositionFusion(pico_tip_feature, out_targets, true);
     }
     out_targets[2] = RatioToTarget(FingerCurlRatio(hand_pos, 5, 6, 8, VR_HAND_CALIBRATION.index_open, VR_HAND_CALIBRATION.index_close));
     out_targets[3] = RatioToTarget(FingerCurlRatio(hand_pos, 9, 10, 12, VR_HAND_CALIBRATION.middle_open, VR_HAND_CALIBRATION.middle_close));
@@ -858,6 +879,39 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
             }
         }
         ThumbPositionFusionCalibration position_fusion_candidate;
+        VrAnchorStability vr_stability_candidate;
+        if (root.contains("vr_anchor_stability")) {
+            const auto& stability = root.at("vr_anchor_stability");
+            vr_stability_candidate.enter_sec = stability.value("enter_sec", 0.08);
+            vr_stability_candidate.release_sec = stability.value("release_sec", 0.18);
+            vr_stability_candidate.switch_sec = stability.value("switch_sec", 0.16);
+            vr_stability_candidate.release_scale = stability.value("release_scale", 1.8);
+            vr_stability_candidate.still_cutoff_hz = stability.value("still_cutoff_hz", 0.65);
+            vr_stability_candidate.anchor_radius_scale = stability.value("anchor_radius_scale", 0.40);
+            vr_stability_candidate.contact_margin_m = stability.value("contact_margin_m", 0.012);
+            vr_stability_candidate.xr_contact_enter_m = stability.value("xr_contact_enter_m", 0.025);
+            vr_stability_candidate.fast_release_scale = stability.value("fast_release_scale", 3.0);
+            vr_stability_candidate.fast_release_sec = stability.value("fast_release_sec", std::min(0.06, vr_stability_candidate.release_sec));
+            vr_stability_candidate.hold_weight = stability.value("hold_weight", 1.0);
+            for (double parameter : {vr_stability_candidate.enter_sec, vr_stability_candidate.release_sec,
+                    vr_stability_candidate.switch_sec, vr_stability_candidate.still_cutoff_hz,
+                    vr_stability_candidate.anchor_radius_scale, vr_stability_candidate.contact_margin_m,
+                    vr_stability_candidate.fast_release_sec, vr_stability_candidate.xr_contact_enter_m}) {
+                if (!std::isfinite(parameter) || parameter <= 0.0) {
+                    error = "VR stability durations and cutoff must be positive finite values"; return false;
+                }
+            }
+            if (!std::isfinite(vr_stability_candidate.release_scale) || vr_stability_candidate.release_scale <= 1.0) {
+                error = "VR stability release_scale must exceed one"; return false;
+            }
+            if (!std::isfinite(vr_stability_candidate.fast_release_scale) ||
+                vr_stability_candidate.fast_release_scale <= vr_stability_candidate.release_scale ||
+                vr_stability_candidate.fast_release_sec > vr_stability_candidate.release_sec ||
+                !std::isfinite(vr_stability_candidate.hold_weight) ||
+                vr_stability_candidate.hold_weight < 0.0 || vr_stability_candidate.hold_weight > 1.0) {
+                error = "invalid VR fast release or hold weight settings"; return false;
+            }
+        }
         if (root.contains("thumb_position_fusion")) {
             const auto& fusion = root.at("thumb_position_fusion");
             position_fusion_candidate.enabled = fusion.value("enabled", true);
@@ -881,6 +935,7 @@ static bool LoadGloveThumbCalibration(const std::string& path, std::string& erro
         g_four_finger_calibration = four_finger_candidate;
         g_gesture_anchors = gesture_candidates;
         g_thumb_position_fusion = position_fusion_candidate;
+        g_vr_anchor_stability = vr_stability_candidate;
         return true;
     } catch (const std::exception& exception) {
         error = std::string("invalid calibration JSON: ") + exception.what();
@@ -915,6 +970,7 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
     std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return (char)std::tolower(c); });
 
     if (mode == "idle" || mode == "none") {
+        g_vr_anchor_stability.reset();
         g_control_mode.store((int)ControlMode::Idle);
         const uint16_t safe_open_targets[6] = {2000, 2000, 2000, 2000, 2000, 2000};
         {
@@ -928,18 +984,21 @@ static bool ParseH5ControlPacket(const json& j, uint16_t out_targets[6], bool& h
     }
 
     if (mode == "glove") {
+        g_vr_anchor_stability.reset();
         g_control_mode.store((int)ControlMode::Glove);
         std::cout << ">>> [H5] control mode -> glove" << std::endl;
         return false;
     }
 
     if (mode == "vr" || mode == "vision" || mode == "hand_tracking") {
+        if ((ControlMode)g_control_mode.load() != ControlMode::Vr) g_vr_anchor_stability.reset();
         g_control_mode.store((int)ControlMode::Vr);
         std::cout << ">>> [H5] control mode -> vr" << std::endl;
         return false;
     }
 
     if (mode == "preset" || mode == "program" || mode == "preprogrammed") {
+        g_vr_anchor_stability.reset();
         g_control_mode.store((int)ControlMode::Preset);
         uint16_t next_targets[6];
         bool has_positions = j.contains("positions") && ReadSixTargets(j["positions"], next_targets);
@@ -1056,7 +1115,7 @@ static double AnchorDistance(
 
 static void ApplyThumbPositionFusion(
     const std::array<double, 9>& feature,
-    uint16_t out_targets[6]) {
+    uint16_t out_targets[6], bool stabilize_vr) {
     g_last_thumb_position_fusion_debug = {};
     if (!g_thumb_position_fusion.enabled) return;
     const auto& index_anchor = g_gesture_anchors[0];
@@ -1080,13 +1139,47 @@ static void ApplyThumbPositionFusion(
         return result;
     };
     const auto point = contact_distances(feature);
+    if (stabilize_vr) {
+        // Only reuse calibrated motor posture. Hi5 hand-local FK positions
+        // are not XR meter-space geometry, even though both use tip distances.
+        const double enter = g_vr_anchor_stability.xr_contact_enter_m;
+        const double raw_ratio = point[0] / std::max(1e-9, point[0] + point[1]);
+        const double proximity = Clip(1.0 - std::min(point[0], point[1]) / (2.0 * enter), 0.0, 1.0);
+        const double raw_weight = g_thumb_position_fusion.influence * proximity * proximity * (3.0 - 2.0 * proximity);
+        if (g_thumb_position_fusion.influence <= 0.0) {
+            g_vr_anchor_stability.reset();
+            return;
+        }
+        const int previous_anchor = g_vr_anchor_stability.active;
+        g_vr_anchor_stability.update(raw_ratio, raw_weight, point[0] / enter, point[1] / enter,
+                                    g_vr_anchor_sample_time, point[0] / enter, point[1] / enter);
+        const double ratio = g_vr_anchor_stability.ratio;
+        const double weight = g_vr_anchor_stability.weight;
+        for (std::size_t channel = 0; channel < 2; ++channel) {
+            const double anchor_target = index_anchor.targets[channel] + ratio *
+                (middle_anchor.targets[channel] - index_anchor.targets[channel]);
+            out_targets[channel] = static_cast<uint16_t>(std::lround(
+                (1.0 - weight) * out_targets[channel] + weight * anchor_target));
+        }
+        g_last_thumb_position_fusion_debug.valid = true;
+        g_last_thumb_position_fusion_debug.segment_ratio = ratio;
+        g_last_thumb_position_fusion_debug.distance_to_segment = std::min(point[0], point[1]);
+        g_last_thumb_position_fusion_debug.weight = weight;
+        g_last_thumb_position_fusion_debug.pitch_target = out_targets[0];
+        g_last_thumb_position_fusion_debug.yaw_target = out_targets[1];
+        if (previous_anchor != g_vr_anchor_stability.active) {
+            std::cout << ">>> [VR contact] anchor=" << g_vr_anchor_stability.active
+                      << " index_mm=" << point[0] * 1000.0 << " middle_mm=" << point[1] * 1000.0 << std::endl;
+        }
+        return;
+    }
     const auto start = contact_distances(index_anchor.tip_positions);
     const auto end = contact_distances(middle_anchor.tip_positions);
     const double dx = end[0] - start[0];
     const double dy = end[1] - start[1];
     const double length_squared = dx * dx + dy * dy;
     if (length_squared < 1e-9) return;
-    const double segment_ratio = Clip(
+    double segment_ratio = Clip(
         ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared,
         0.0, 1.0);
     const double closest_x = start[0] + segment_ratio * dx;
@@ -1094,7 +1187,7 @@ static void ApplyThumbPositionFusion(
     const double distance = std::hypot(point[0] - closest_x, point[1] - closest_y);
     const double proximity = Clip(
         1.0 - distance / g_thumb_position_fusion.support_radius, 0.0, 1.0);
-    const double weight = g_thumb_position_fusion.influence *
+    double weight = g_thumb_position_fusion.influence *
         proximity * proximity * (3.0 - 2.0 * proximity);
     auto fuse = [&](std::size_t channel) {
         const double position_target = index_anchor.targets[channel] + segment_ratio *
@@ -1360,6 +1453,7 @@ static bool ParseUnityUdpPacket(const char* data, int len, uint16_t out_targets[
 
         const bool is_vr_packet = IsVrHandPacket(j);
         const ControlMode active_mode = (ControlMode)g_control_mode.load();
+        if (active_mode != ControlMode::Vr) g_vr_anchor_stability.reset();
         bool accepted = false;
         if (active_mode == ControlMode::Vr) {
             accepted = is_vr_packet && MapVrHandTrackingToTargets(j, out_targets);
@@ -1541,11 +1635,20 @@ void ComplianceControlLoop() {
                 }
             }
 
-            double max_step = DESIRED_SLEW_RATE * real_dt;
-            double delta = (double)desired_pos[i] - desired_filters[i];
-            delta = Clip(delta, -max_step, max_step);
-            desired_filters[i] += delta;
-            shaped_desired[i] = Clamp((int)std::lround(desired_filters[i]), 0, 2000);
+            // XR positions have already passed through the shared 21x3
+            // skeleton filter before retargeting. Do not add another temporal
+            // shaper after the nonlinear hand mapping. Glove and preset modes
+            // retain the legacy slew limiter.
+            if ((ControlMode)g_control_mode.load() == ControlMode::Vr) {
+                desired_filters[i] = (double)desired_pos[i];
+                shaped_desired[i] = desired_pos[i];
+            } else {
+                double max_step = DESIRED_SLEW_RATE * real_dt;
+                double delta = (double)desired_pos[i] - desired_filters[i];
+                delta = Clip(delta, -max_step, max_step);
+                desired_filters[i] += delta;
+                shaped_desired[i] = Clamp((int)std::lround(desired_filters[i]), 0, 2000);
+            }
 
             // --- Per-channel admittance policy ---
             const double closure = std::max(0.0, std::min(1.0, (2000.0 - (double)current_pos[i]) / 2000.0));
@@ -1814,6 +1917,14 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+    std::cout << ">>> VR acquisition build: " << VR_ACQUISITION_BUILD
+              << " | compiled " << __DATE__ << " " << __TIME__ << std::endl;
+    wchar_t loaded_exe[32768] = {};
+    const DWORD loaded_length = GetModuleFileNameW(nullptr, loaded_exe, 32768);
+    const int path_bytes = WideCharToMultiByte(CP_UTF8, 0, loaded_exe, loaded_length, nullptr, 0, nullptr, nullptr);
+    std::string loaded_path(path_bytes, '\0');
+    if (path_bytes > 0) WideCharToMultiByte(CP_UTF8, 0, loaded_exe, loaded_length, &loaded_path[0], path_bytes, nullptr, nullptr);
+    std::cout << ">>> Loaded executable: " << loaded_path << std::endl;
 
     std::cout << ">>> 准备连接灵巧手..." << std::endl;
 
@@ -2160,6 +2271,15 @@ int main(int argc, char* argv[]) {
                              native_payload["source_timestamp_ns"] = GetCurrentTimeNs();
                              native_payload["mapped_target_units"] =
                                  std::vector<uint16_t>(temp_pos, temp_pos + 6);
+                             if (source == "pico_hand") {
+                                 native_payload["vr_anchor_stability"] = {
+                                     {"build", VR_ACQUISITION_BUILD},
+                                     {"contact_units", "m"},
+                                     {"enter_m", g_vr_anchor_stability.xr_contact_enter_m},
+                                     {"active_anchor", g_vr_anchor_stability.active},
+                                     {"segment_ratio", g_vr_anchor_stability.ratio},
+                                     {"weight", g_vr_anchor_stability.weight}};
+                             }
                              if (source == "data_glove") {
                                  native_payload["glove_calibration_id"] =
                                      g_glove_thumb_mapper.configured()

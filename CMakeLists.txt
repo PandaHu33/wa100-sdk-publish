@@ -156,6 +156,9 @@ if(WIN32)
 endif()
 
 enable_testing()
+add_executable(vr_anchor_stability_test ${SDK_ROOT_DIR}/tests/vr_anchor_stability_test.cpp)
+target_include_directories(vr_anchor_stability_test PRIVATE ${EXAMPLES_DIR})
+add_test(NAME vr_anchor_stability_test COMMAND vr_anchor_stability_test)
 add_executable(glove_thumb_mapper_test
     ${SDK_ROOT_DIR}/tests/glove_thumb_mapper_test.cpp
     ${EXAMPLES_DIR}/glove_thumb_mapper.cpp
